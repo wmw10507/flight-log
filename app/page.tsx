@@ -3,6 +3,7 @@
 import {
   useEffect,
   useMemo,
+  useRef,
   useState,
   type CSSProperties,
   type ReactNode,
@@ -14,7 +15,7 @@ import {
 
 type Choice = "" | "Y" | "N";
 type PfPm = "" | "PF" | "PM";
-type MainTab = "today" | "history" | "recency";
+type MainTab = "today" | "history" | "recency" | "captains";
 type Theme = "light" | "dark";
 
 type Flight = {
@@ -139,6 +140,12 @@ type CaptainProfile = {
 
   flights: CaptainFlight[];
 };
+
+type CaptainSummary = Pick<CaptainProfile, "captain" | "note" | "tags" | "computed">;
+
+function captainKey(name: string) {
+  return name.trim().replace(/\s+/g, " ").toLocaleLowerCase();
+}
 
 /* =========================================================
    API
@@ -380,6 +387,30 @@ export default function Home() {
   ] =
     useState("");
 
+  /* CAPTAIN DIRECTORY */
+
+  const [captains, setCaptains] = useState<CaptainSummary[]>([]);
+  const [captainsLoaded, setCaptainsLoaded] = useState(false);
+  const [captainsLoading, setCaptainsLoading] = useState(false);
+  const [captainsError, setCaptainsError] = useState("");
+  const [captainSearch, setCaptainSearch] = useState("");
+  const [todayCaptainResult, setTodayCaptainResult] = useState<{
+    key: string; profile: CaptainSummary | null; error: string;
+  } | null>(null);
+  const [todayCaptainRetry, setTodayCaptainRetry] = useState(0);
+  const profileRequest = useRef(0);
+  const directoryRequest = useRef(false);
+  const summaryRevision = useRef(0);
+  const summaryUpdates = useRef(new Map<string, { revision: number; profile: CaptainSummary }>());
+
+  const filteredCaptains = useMemo(() => {
+    const terms = captainKey(captainSearch).split(" ").filter(Boolean);
+    return captains.filter(captain => {
+      const searchable = captainKey([captain.captain, captain.note, ...captain.tags].join(" "));
+      return terms.every(term => searchable.includes(term));
+    });
+  }, [captains, captainSearch]);
+
   /* HISTORY */
 
   const now =
@@ -617,6 +648,29 @@ export default function Home() {
     ]
   );
 
+  const selectedCaptain = selectedFlight?.pic?.trim() || "";
+  const todayCaptainKey = selectedCaptain + ":" + todayCaptainRetry;
+  const todayCaptainLoading = Boolean(selectedCaptain) && todayCaptainResult?.key !== todayCaptainKey;
+  const todayCaptain = todayCaptainResult?.key === todayCaptainKey ? todayCaptainResult.profile : null;
+  const todayCaptainError = todayCaptainResult?.key === todayCaptainKey ? todayCaptainResult.error : "";
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!selectedCaptain) return;
+    const revision = summaryRevision.current;
+    apiCall("getCaptainProfile", { captain: selectedCaptain })
+      .then((profile: CaptainProfile) => {
+        if (!cancelled) {
+          const update = summaryUpdates.current.get(captainKey(selectedCaptain));
+          setTodayCaptainResult({ key: todayCaptainKey, profile: update && update.revision > revision ? update.profile : profile, error: "" });
+        }
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) setTodayCaptainResult({ key: todayCaptainKey, profile: null, error: error instanceof Error ? error.message : String(error) });
+      });
+    return () => { cancelled = true; };
+  }, [selectedCaptain, todayCaptainKey]);
+
   /* CLOSE DRAWER WITH ESC */
 
   useEffect(
@@ -795,15 +849,48 @@ export default function Home() {
      CAPTAIN PROFILE
   ======================================================= */
 
-  async function openCaptainProfile() {
+  async function loadCaptains() {
+    if (directoryRequest.current) return;
+    directoryRequest.current = true;
+    const revision = summaryRevision.current;
+    setCaptainsLoading(true);
+    setCaptainsError("");
+    try {
+      const data: { captains: CaptainSummary[] } = await apiCall("getCaptains");
+      if (!Array.isArray(data.captains)) throw new Error("Captain 목록 응답을 확인해 주세요.");
+      setCaptains(data.captains.map(item => {
+        const update = summaryUpdates.current.get(captainKey(item.captain));
+        return update && update.revision > revision ? update.profile : item;
+      }));
+      setCaptainsLoaded(true);
+    } catch (error) {
+      setCaptainsError(error instanceof Error ? error.message : String(error));
+    } finally {
+      directoryRequest.current = false;
+      setCaptainsLoading(false);
+    }
+  }
 
-    const captain =
-      selectedFlight?.pic?.trim();
+  function syncCaptainSummary(profile: CaptainProfile) {
+    summaryUpdates.current.set(captainKey(profile.captain), {
+      revision: ++summaryRevision.current,
+      profile,
+    });
+    setCaptains(current => current.map(item =>
+      captainKey(item.captain) === captainKey(profile.captain) ? profile : item
+    ));
+    if (captainKey(profile.captain) === captainKey(selectedCaptain)) setTodayCaptainResult({ key: todayCaptainKey, profile, error: "" });
+  }
+
+  async function openCaptainProfile(name = selectedCaptain) {
+    const captain = name.trim();
 
     if (!captain) {
       return;
     }
 
+    const request = ++profileRequest.current;
+    setCaptainProfile(null);
     setCaptainOpen(true);
     setCaptainLoading(true);
     setCaptainError("");
@@ -819,7 +906,9 @@ export default function Home() {
           }
         );
 
+      if (request !== profileRequest.current) return;
       setCaptainProfile(data);
+      syncCaptainSummary(data);
 
       setCaptainNote(
         data.note ||
@@ -833,6 +922,7 @@ export default function Home() {
 
     } catch (err) {
 
+      if (request !== profileRequest.current) return;
       setCaptainError(
         err instanceof Error
           ? err.message
@@ -841,7 +931,7 @@ export default function Home() {
 
     } finally {
 
-      setCaptainLoading(false);
+      if (request === profileRequest.current) setCaptainLoading(false);
     }
   }
 
@@ -851,6 +941,7 @@ export default function Home() {
       return;
     }
 
+    const request = profileRequest.current;
     try {
 
       setCaptainSaving(true);
@@ -890,6 +981,8 @@ export default function Home() {
           }
         );
 
+      syncCaptainSummary(refreshed);
+      if (request !== profileRequest.current) return;
       setCaptainProfile(
         refreshed
       );
@@ -910,6 +1003,7 @@ export default function Home() {
 
     } catch (err) {
 
+      if (request !== profileRequest.current) return;
       setCaptainSaveMessage(
         "오류 · " +
         (
@@ -934,6 +1028,10 @@ export default function Home() {
   ) {
 
     setTab(next);
+
+    if (next === "captains" && !captainsLoaded) {
+      void loadCaptains();
+    }
 
     if (
       next === "history" &&
@@ -1166,7 +1264,7 @@ export default function Home() {
             NAV
         ================================================== */}
 
-        <nav className="mt-7 flex gap-7 border-b border-[var(--line)]">
+        <nav aria-label="Main navigation" className="mt-7 flex gap-5 border-b border-[var(--line)] sm:gap-7">
 
           <TopTab
             active={
@@ -1210,6 +1308,10 @@ export default function Home() {
             }
           >
             Recency
+          </TopTab>
+
+          <TopTab active={tab === "captains"} onClick={() => selectTab("captains")}>
+            Captains
           </TopTab>
 
         </nav>
@@ -1729,10 +1831,10 @@ export default function Home() {
                                   <button
                                     type="button"
                                     onClick={
-                                      openCaptainProfile
+                                      () => void openCaptainProfile()
                                     }
                                     disabled={
-                                      !selectedFlight
+                                      captainSaving || !selectedFlight
                                         .pic
                                     }
                                     className="rounded-xl bg-[var(--blue-soft)] px-4 py-3 text-[14px] font-semibold text-[var(--blue)] transition hover:opacity-80 disabled:opacity-30"
@@ -1742,6 +1844,19 @@ export default function Home() {
 
                                 </div>
 
+
+                                <div className="mt-3" aria-live="polite">
+                                  {todayCaptainLoading ? (
+                                    <p className="text-[13px] text-[var(--muted)]">Tags를 불러오는 중...</p>
+                                  ) : todayCaptainError ? (
+                                    <div className="text-[13px] text-[var(--danger)]">
+                                      Tags를 불러오지 못했어요.
+                                      <button type="button" onClick={() => setTodayCaptainRetry(value => value + 1)} className="ml-2 underline">다시 시도</button>
+                                    </div>
+                                  ) : todayCaptain && captainKey(todayCaptain.captain) === captainKey(selectedCaptain) ? (
+                                    <CaptainTags tags={todayCaptain.tags} />
+                                  ) : null}
+                                </div>
 
                                 <div className="mt-5 rounded-[18px] bg-[var(--soft)] px-4 py-4">
 
@@ -2156,6 +2271,45 @@ export default function Home() {
           )
         }
 
+        {tab === "captains" && (
+          <section className="pt-8">
+            <div className="flex items-center justify-between gap-4">
+              <div>
+                <h2 className="text-[30px] font-bold tracking-[-0.045em]">Captains</h2>
+                <p className="mt-1 text-[14px] text-[var(--muted)]">함께 비행한 Captain의 메모와 태그</p>
+              </div>
+              <button type="button" disabled={captainsLoading || captainSaving} onClick={() => void loadCaptains()} className="rounded-xl bg-[var(--soft)] px-4 py-3 text-[13px] font-semibold disabled:opacity-30">새로고침</button>
+            </div>
+            <label htmlFor="captain-search" className="mt-7 block text-[13px] font-semibold text-[var(--muted)]">Captain Search</label>
+            <input id="captain-search" type="search" value={captainSearch} onChange={event => setCaptainSearch(event.target.value)} placeholder="이름, Tags, Captain Comment 검색" className="mt-2 w-full rounded-2xl border border-[var(--line)] bg-[var(--soft)] px-4 py-4 text-[15px] outline-none focus:border-[var(--blue)]" />
+            {captainsLoading ? <SimpleLoading text="Captain 목록을 불러오는 중..." /> : captainsError ? (
+              <SimpleError message={captainsError} onRetry={loadCaptains} />
+            ) : captainsLoaded ? (
+              <>
+                <p aria-live="polite" className="mt-5 text-[13px] text-[var(--muted)]">{filteredCaptains.length} / {captains.length} captains</p>
+                {filteredCaptains.length ? (
+                  <div className="mt-2 divide-y divide-[var(--line)]">
+                    {filteredCaptains.map(captain => (
+                      <button type="button" key={captainKey(captain.captain)} disabled={captainSaving} onClick={() => void openCaptainProfile(captain.captain)} aria-label={captain.captain + " Profile 열기"} className="flex w-full items-center justify-between gap-3 rounded-xl px-2 py-5 text-left transition hover:bg-[var(--soft)] focus-visible:outline-2 focus-visible:outline-[var(--blue)] disabled:opacity-30">
+                        <div className="min-w-0">
+                          <div className="break-words text-[19px] font-bold tracking-[-0.025em]">{captain.captain}</div>
+                          <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[13px] text-[var(--muted)]">
+                            <span>{captain.computed.sectors} sectors together</span>
+                            <span>Last flown · {captain.computed.lastFlown ? formatDateLong(captain.computed.lastFlown) : "—"}</span>
+                          </div>
+                          <div className="mt-3"><CaptainTags tags={captain.tags} /></div>
+                        </div>
+                        <span className="shrink-0 rounded-xl bg-[var(--blue-soft)] px-3 py-2 text-[13px] font-semibold text-[var(--blue)]">Profile →</span>
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="py-12 text-center text-[14px] text-[var(--muted)]">{captains.length ? "검색 결과가 없어요. 다른 이름이나 태그로 검색해 주세요." : "등록된 Captain이 없어요."}</p>
+                )}
+              </>
+            ) : null}
+          </section>
+        )}
       </div>
 
 
@@ -2212,6 +2366,17 @@ export default function Home() {
 /* =========================================================
    CAPTAIN DRAWER
 ========================================================= */
+
+function CaptainTags({ tags }: { tags: string[] }) {
+  if (!tags.length) return <span className="text-[12px] text-[var(--muted)]">등록된 태그 없음</span>;
+  return (
+    <span className="flex flex-wrap gap-2">
+      {Array.from(new Set(tags)).map(tag => (
+        <span key={tag} className="max-w-full break-words rounded-lg bg-[var(--blue-soft)] px-2.5 py-1 text-[12px] font-semibold text-[var(--blue)]">{tag}</span>
+      ))}
+    </span>
+  );
+}
 
 function CaptainDrawer({
   loading,
