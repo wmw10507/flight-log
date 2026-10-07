@@ -151,40 +151,58 @@ function captainKey(name: string) {
    API
 ========================================================= */
 
-async function apiCall(
-  action: string,
-  payload?: unknown
-) {
-  const response = await fetch(
-    "/api/flight",
-    {
-      method: "POST",
+const APP_VERSION = "0.2.6";
+const readActions = new Set(["getAppData", "getHistoryMonth", "getRecencyData", "getCaptains", "getCaptainProfile"]);
+const clientReads = new Map<string, { value: unknown; expires: number }>();
+const pendingReads = new Map<string, Promise<any>>();
+let clientGeneration = 0;
 
-      headers: {
-        "Content-Type":
-          "application/json",
-      },
+function invalidateClientReads() {
+  clientGeneration++;
+  clientReads.clear();
+  pendingReads.clear();
+}
 
-      body: JSON.stringify({
-        action,
-        payload,
-      }),
-
-      cache: "no-store",
-    }
-  );
-
-  const data =
-    await response.json();
-
-  if (!response.ok) {
-    throw new Error(
-      data.error ||
-        "Request failed."
-    );
+async function apiCall(action: string, payload?: unknown, fresh = false): Promise<any> {
+  const isRead = readActions.has(action);
+  // Always isolate writes from prior reads, including ambiguous network failures.
+  if (!isRead) invalidateClientReads();
+  const generation = clientGeneration;
+  const key = JSON.stringify([generation, action, payload ?? null, fresh]);
+  if (isRead) {
+    const hit = clientReads.get(key);
+    if (!fresh && hit && hit.expires > Date.now()) return hit.value;
+    const pending = pendingReads.get(key);
+    if (pending) return pending;
   }
-
-  return data;
+  const request = (async () => {
+    try {
+      const response = await fetch("/api/flight", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action, payload: fresh ? { ...(payload as object ?? {}), __fresh: true } : payload }),
+        cache: "no-store",
+      });
+      const data = await response.json();
+      if (!response.ok || data.ok === false || data.error) {
+        throw new Error(data.error || "Request failed.");
+      }
+      // A read started before a save must fetch the current generation.
+      if (isRead && generation !== clientGeneration) return apiCall(action, payload, true);
+      if (isRead && generation === clientGeneration) {
+        const normalKey = JSON.stringify([generation, action, payload ?? null, false]);
+        // Keep the cache bounded while browsing many months/captains.
+        if (clientReads.size >= 64) clientReads.delete(clientReads.keys().next().value!);
+        clientReads.set(normalKey, { value: data, expires: Date.now() + (action === "getCaptains" ? 120000 : 30000) });
+      }
+      return data;
+    } finally {
+      if (!isRead) invalidateClientReads();
+    }
+  })();
+  if (isRead) pendingReads.set(key, request);
+  try { return await request; }
+  finally { if (pendingReads.get(key) === request) pendingReads.delete(key); }
 }
 
 /* =========================================================
@@ -261,6 +279,9 @@ function getThemeVars(
 ========================================================= */
 
 export default function Home() {
+  const historyRequest = useRef(0);
+  const captainRetrySeen = useRef(0);
+  const [backendVersion, setBackendVersion] = useState("");
 
   const [theme, setTheme] =
     useState<Theme>("light");
@@ -584,7 +605,7 @@ export default function Home() {
 
   useEffect(
     () => {
-      loadAppData();
+      loadAppData(false);
     },
     []
   );
@@ -657,8 +678,10 @@ export default function Home() {
   useEffect(() => {
     let cancelled = false;
     if (!selectedCaptain) return;
+    const fresh = captainRetrySeen.current !== todayCaptainRetry;
+    captainRetrySeen.current = todayCaptainRetry;
     const revision = summaryRevision.current;
-    apiCall("getCaptainProfile", { captain: selectedCaptain })
+    apiCall("getCaptainProfile", { captain: selectedCaptain }, fresh)
       .then((profile: CaptainProfile) => {
         if (!cancelled) {
           const update = summaryUpdates.current.get(captainKey(selectedCaptain));
@@ -706,7 +729,7 @@ export default function Home() {
      LOAD DATA
   ======================================================= */
 
-  async function loadAppData() {
+  async function loadAppData(fresh = true) {
 
     try {
 
@@ -715,9 +738,10 @@ export default function Home() {
 
       const data: AppData =
         await apiCall(
-          "getAppData"
+          "getAppData", undefined, fresh
         );
 
+      setBackendVersion((data as AppData & { backendVersion?: string }).backendVersion || "unknown");
       const past =
         data.pastFlights ||
         [];
@@ -775,8 +799,10 @@ export default function Home() {
 
   async function loadHistory(
     year = historyYear,
-    month = historyMonth
+    month = historyMonth,
+    fresh = true
   ) {
+    const request = ++historyRequest.current;
 
     try {
 
@@ -789,9 +815,10 @@ export default function Home() {
           {
             year,
             month,
-          }
+          }, fresh
         );
 
+      if (request !== historyRequest.current) return;
       setHistoryFlights(
         data.flights ||
         []
@@ -805,6 +832,7 @@ export default function Home() {
 
     } catch (err) {
 
+      if (request !== historyRequest.current) return;
       setHistoryError(
         err instanceof Error
           ? err.message
@@ -813,11 +841,11 @@ export default function Home() {
 
     } finally {
 
-      setHistoryLoading(false);
+      if (request === historyRequest.current) setHistoryLoading(false);
     }
   }
 
-  async function loadRecency() {
+  async function loadRecency(fresh = true) {
 
     try {
 
@@ -826,7 +854,7 @@ export default function Home() {
 
       const data: RecencyData =
         await apiCall(
-          "getRecencyData"
+          "getRecencyData", undefined, fresh
         );
 
       setRecency(data);
@@ -849,14 +877,14 @@ export default function Home() {
      CAPTAIN PROFILE
   ======================================================= */
 
-  async function loadCaptains() {
+  async function loadCaptains(fresh = true) {
     if (directoryRequest.current) return;
     directoryRequest.current = true;
     const revision = summaryRevision.current;
     setCaptainsLoading(true);
     setCaptainsError("");
     try {
-      const data: { captains: CaptainSummary[] } = await apiCall("getCaptains");
+      const data: { captains: CaptainSummary[] } = await apiCall("getCaptains", undefined, fresh);
       if (!Array.isArray(data.captains)) throw new Error("Captain 목록 응답을 확인해 주세요.");
       setCaptains(data.captains.map(item => {
         const update = summaryUpdates.current.get(captainKey(item.captain));
@@ -956,7 +984,7 @@ export default function Home() {
           )
           .filter(Boolean);
 
-      await apiCall(
+      const saved = await apiCall(
         "saveCaptainProfile",
         {
           captain:
@@ -972,7 +1000,7 @@ export default function Home() {
 
       const refreshed:
         CaptainProfile =
-        await apiCall(
+        saved.profile || await apiCall(
           "getCaptainProfile",
           {
             captain:
@@ -1030,21 +1058,21 @@ export default function Home() {
     setTab(next);
 
     if (next === "captains" && !captainsLoaded) {
-      void loadCaptains();
+      void loadCaptains(false);
     }
 
     if (
       next === "history" &&
       !historyLoaded
     ) {
-      loadHistory();
+      loadHistory(historyYear, historyMonth, false);
     }
 
     if (
       next === "recency" &&
       !recency
     ) {
-      loadRecency();
+      loadRecency(false);
     }
   }
 
@@ -1090,6 +1118,13 @@ export default function Home() {
           }
         );
 
+      setHistoryLoaded(false);
+      setRecency(null);
+      setCaptainsLoaded(false);
+      summaryUpdates.current.clear();
+      historyRequest.current++;
+      setHistoryLoading(false);
+      setTodayCaptainRetry(value => value + 1);
       setPastFlights(
         flights =>
           flights.map(
@@ -1195,7 +1230,7 @@ export default function Home() {
 
     loadHistory(
       year,
-      month
+      month, false
     );
   }
 
@@ -1343,7 +1378,7 @@ export default function Home() {
                         todayError
                       }
                       onRetry={
-                        loadAppData
+                        () => void loadAppData()
                       }
                     />
                   )
@@ -2229,7 +2264,7 @@ export default function Home() {
                         recencyError
                       }
                       onRetry={
-                        loadRecency
+                        () => void loadRecency()
                       }
                     />
                   )
@@ -2283,7 +2318,7 @@ export default function Home() {
             <label htmlFor="captain-search" className="mt-7 block text-[13px] font-semibold text-[var(--muted)]">Captain Search</label>
             <input id="captain-search" type="search" value={captainSearch} onChange={event => setCaptainSearch(event.target.value)} placeholder="이름, Tags, Captain Comment 검색" className="mt-2 w-full rounded-2xl border border-[var(--line)] bg-[var(--soft)] px-4 py-4 text-[15px] outline-none focus:border-[var(--blue)]" />
             {captainsLoading ? <SimpleLoading text="Captain 목록을 불러오는 중..." /> : captainsError ? (
-              <SimpleError message={captainsError} onRetry={loadCaptains} />
+              <SimpleError message={captainsError} onRetry={() => void loadCaptains()} />
             ) : captainsLoaded ? (
               <>
                 <p aria-live="polite" className="mt-5 text-[13px] text-[var(--muted)]">{filteredCaptains.length} / {captains.length} captains</p>
@@ -2359,6 +2394,16 @@ export default function Home() {
         )
       }
 
+      <footer className="px-4 py-6 text-center text-[11px] text-[var(--muted)]">
+        App {APP_VERSION} · Backend {backendVersion || "…"}
+        <button type="button" className="ml-3 underline" disabled={saving || captainSaving || todayLoading || historyLoading || recencyLoading || captainsLoading}
+          onClick={() => {
+            if (tab === "today") { void loadAppData(); setTodayCaptainRetry(value => value + 1); }
+            else if (tab === "history") void loadHistory();
+            else if (tab === "recency") void loadRecency();
+            else void loadCaptains();
+          }}>현재 탭 새로고침</button>
+      </footer>
     </main>
   );
 }
