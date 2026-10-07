@@ -142,6 +142,7 @@ type CaptainProfile = {
 };
 
 type CaptainSummary = Pick<CaptainProfile, "captain" | "note" | "tags" | "computed">;
+type CaptainCard = Pick<CaptainProfile, "captain" | "note" | "tags">;
 
 function captainKey(name: string) {
   return name.trim().replace(/\s+/g, " ").toLocaleLowerCase();
@@ -151,8 +152,8 @@ function captainKey(name: string) {
    API
 ========================================================= */
 
-const APP_VERSION = "0.2.6";
-const readActions = new Set(["getAppData", "getHistoryMonth", "getRecencyData", "getCaptains", "getCaptainProfile"]);
+const APP_VERSION = "0.2.7";
+const readActions = new Set(["getAppData", "getHistoryMonth", "getRecencyData", "getCaptains", "getCaptainProfile", "getCaptainCard"]);
 const clientReads = new Map<string, { value: unknown; expires: number }>();
 const pendingReads = new Map<string, Promise<any>>();
 let clientGeneration = 0;
@@ -416,7 +417,7 @@ export default function Home() {
   const [captainsError, setCaptainsError] = useState("");
   const [captainSearch, setCaptainSearch] = useState("");
   const [todayCaptainResult, setTodayCaptainResult] = useState<{
-    key: string; profile: CaptainSummary | null; error: string;
+    key: string; profile: CaptainCard | null; error: string;
   } | null>(null);
   const [todayCaptainRetry, setTodayCaptainRetry] = useState(0);
   const profileRequest = useRef(0);
@@ -677,12 +678,12 @@ export default function Home() {
 
   useEffect(() => {
     let cancelled = false;
-    if (!selectedCaptain) return;
+    if (!selectedCaptain || tab !== "today") return;
     const fresh = captainRetrySeen.current !== todayCaptainRetry;
     captainRetrySeen.current = todayCaptainRetry;
     const revision = summaryRevision.current;
-    apiCall("getCaptainProfile", { captain: selectedCaptain }, fresh)
-      .then((profile: CaptainProfile) => {
+    apiCall("getCaptainCard", { captain: selectedCaptain }, fresh)
+      .then((profile: CaptainCard) => {
         if (!cancelled) {
           const update = summaryUpdates.current.get(captainKey(selectedCaptain));
           setTodayCaptainResult({ key: todayCaptainKey, profile: update && update.revision > revision ? update.profile : profile, error: "" });
@@ -692,7 +693,7 @@ export default function Home() {
         if (!cancelled) setTodayCaptainResult({ key: todayCaptainKey, profile: null, error: error instanceof Error ? error.message : String(error) });
       });
     return () => { cancelled = true; };
-  }, [selectedCaptain, todayCaptainKey]);
+  }, [selectedCaptain, todayCaptainKey, tab]);
 
   /* CLOSE DRAWER WITH ESC */
 
@@ -733,7 +734,7 @@ export default function Home() {
 
     try {
 
-      setTodayLoading(true);
+      setTodayLoading(pastFlights.length === 0 && upcomingRotation.length === 0);
       setTodayError("");
 
       const data: AppData =
@@ -806,7 +807,7 @@ export default function Home() {
 
     try {
 
-      setHistoryLoading(true);
+      setHistoryLoading(!historyLoaded || year !== historyYear || month !== historyMonth);
       setHistoryError("");
 
       const data: HistoryData =
@@ -849,7 +850,7 @@ export default function Home() {
 
     try {
 
-      setRecencyLoading(true);
+      setRecencyLoading(!recency);
       setRecencyError("");
 
       const data: RecencyData =
@@ -881,7 +882,7 @@ export default function Home() {
     if (directoryRequest.current) return;
     directoryRequest.current = true;
     const revision = summaryRevision.current;
-    setCaptainsLoading(true);
+    setCaptainsLoading(!captainsLoaded);
     setCaptainsError("");
     try {
       const data: { captains: CaptainSummary[] } = await apiCall("getCaptains", undefined, fresh);
