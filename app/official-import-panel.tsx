@@ -66,6 +66,7 @@ type AnalyzeResponse = {
   };
   parserWarnings: string[];
   preview: Preview;
+  confirmEnabled: boolean;
 };
 
 type ConfirmResponse = {
@@ -207,6 +208,7 @@ export default function OfficialImportPanel() {
     analysis.parserWarnings.length > 0 ||
     !analysis.preview.canConfirm ||
     analysis.preview.alreadyImported ||
+    !analysis.confirmEnabled ||
     busy !== "";
 
   return (
@@ -407,6 +409,12 @@ export default function OfficialImportPanel() {
               원본 PDF 보관 → rolling coverage 검증 → redundant PDF만
               Archive_Redundant 이동. 원본은 삭제하지 않습니다.
             </div>
+
+            {!analysis.confirmEnabled ? (
+              <div className="mt-4 rounded-2xl bg-[var(--amber-soft)] p-4 text-[12px] font-semibold text-[var(--amber)]">
+                Confirm은 서버에서 잠겨 있습니다. Analyze는 read-only로 사용할 수 있습니다.
+              </div>
+            ) : null}
 
             <button
               type="button"
