@@ -8,6 +8,7 @@ import {
   type CSSProperties,
   type ReactNode,
 } from "react";
+import OfficialImportPanel from "./official-import-panel";
 
 /* =========================================================
    TYPES
@@ -15,7 +16,7 @@ import {
 
 type Choice = "" | "Y" | "N";
 type PfPm = "" | "PF" | "PM";
-type MainTab = "today" | "history" | "recency" | "captains";
+type MainTab = "today" | "history" | "recency" | "captains" | "official";
 type Theme = "light" | "dark";
 
 type Flight = {
@@ -158,7 +159,7 @@ function captainKey(name: string) {
    API
 ========================================================= */
 
-const APP_VERSION = "0.2.8";
+const APP_VERSION = "0.3.0";
 const readActions = new Set(["getAppData", "getHistoryMonth", "getRecencyData", "getCaptains", "getCaptainProfile", "getCaptainCard"]);
 const clientReads = new Map<string, { value: unknown; expires: number }>();
 const pendingReads = new Map<string, Promise<any>>();
@@ -1359,6 +1360,10 @@ export default function Home() {
             Captains
           </TopTab>
 
+          <TopTab active={tab === "official"} onClick={() => selectTab("official")}>
+            Official
+          </TopTab>
+
         </nav>
 
 
@@ -2315,6 +2320,8 @@ export default function Home() {
             </div>
           )
         }
+
+        {tab === "official" && <OfficialImportPanel />}
 
         {tab === "captains" && (
           <section className="pt-8">
