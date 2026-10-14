@@ -6530,7 +6530,14 @@ function appendDocumentRegister_(sheet, sourceId, source, fileInfo, status, note
 
 function updateDocumentRegisterStorage_(sheet, rowNumber, source, fileInfo, storage, extra) {
   const note = officialImportNotes_(source, fileInfo, storage, extra);
-  sheet.getRange(rowNumber, 7).setValue(storage === 'FAILED' ? 'IMPORT FAILED' : 'SOURCE PROVIDED');
+  const verification =
+    storage === 'FAILED'
+      ? 'IMPORT FAILED'
+      : storage === 'IMPORTING'
+      ? 'IMPORTING'
+      : 'SOURCE PROVIDED';
+
+  sheet.getRange(rowNumber, 7).setValue(verification);
   sheet.getRange(rowNumber, 9).setValue(note);
 }
 
