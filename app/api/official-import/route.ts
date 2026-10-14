@@ -69,7 +69,8 @@ async function extractPdf(file: File) {
 
   const sha256 = createHash("sha256").update(bytes).digest("hex");
 
-  const pdf = await getDocumentProxy(bytes, {
+  // PDF.js can transfer/detach its input buffer. Keep the original for storage.
+  const pdf = await getDocumentProxy(bytes.slice(), {
     maxImageSize: 16_777_216,
     disableFontFace: true,
     useSystemFonts: false,
