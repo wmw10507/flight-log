@@ -358,3 +358,47 @@ test("blank official A/L clears a provisional nonblank value without inference",
 
   assert.equal(row[27], "");
 });
+
+
+test("day time derives from block minus night, not MOLIT partial credit", () => {
+  const mixed = {
+    ...official,
+    block: "10:00",
+    companyTime: "05:00",
+    molitTime: "05:00",
+    night: "03:00",
+  };
+
+  const existingRow = makeMaster();
+  const e = env([existingRow], [makeQueue()]);
+  const preview = e.run(
+    "previewOfficialImport(" +
+      JSON.stringify({ source, records: [mixed] }) +
+      ")"
+  );
+
+  e.run(
+    "applyOfficialToExistingRow_(" +
+      'SpreadsheetApp.openById("x").getSheetByName("FLIGHT_LOG_MASTER"),' +
+      JSON.stringify(preview.items[0]) +
+      ',"SRC-TEST")'
+  );
+
+  assert.equal(existingRow[19], "=MAX(0,Q2-U2)");
+
+  const item = {
+    ...preview.items[0],
+    status: "NEW",
+    masterRow: null,
+    masterLogId: "",
+  };
+  const built = e.run(
+    "buildOfficialNewMasterRow_(2," +
+      JSON.stringify(item) +
+      ',"SRC-TEST",' +
+      JSON.stringify([makeQueue()]) +
+      ")"
+  );
+
+  assert.equal(built.row[19], "=MAX(0,Q2-U2)");
+});
