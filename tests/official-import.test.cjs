@@ -310,3 +310,19 @@ test("rolling coverage keeps the older report when the newest report drops the f
   assert.equal(plan.earliest, "2026-04-11");
   assert.equal(plan.latest, "2026-10-06");
 });
+
+
+test("coverage gaps prevent archive minimization", () => {
+  const e = env([], []);
+  const plan = e.run(
+    'selectMinimalCoverageIntervals_([' +
+      '{from:"2026-04-11",to:"2026-09-01",fileInfo:{id:"a"}},' +
+      '{from:"2026-09-03",to:"2026-10-06",fileInfo:{id:"b"}}' +
+    '])'
+  );
+
+  assert.equal(plan.gap, true);
+  assert.equal(plan.gapAt, "2026-09-02");
+  assert.equal(plan.selected.a, true);
+  assert.equal(plan.selected.b, undefined);
+});
