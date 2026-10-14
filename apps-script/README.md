@@ -51,7 +51,7 @@ This branch adds a guarded **Analyze → Preview → Confirm** import path for K
 - `SCHEDULE_QUEUE.Master Log ID` is used first when available, including Calendar/Official date-boundary sectors such as KE164.
 - `Duty Code EX` / deadhead / travel evidence remains outside the operating Master. If an excluded sector unexpectedly already has an operating Master row, import is blocked for review.
 - User-owned Approach Type/No., PF/PM override, Flight Comment, Tags, and post-flight completion state are not overwritten by official import.
-- Official Registration, Duty Code, OUT/IN, Block, Company/MOLIT, Night, INST, T/O, L/D and nonblank A/L win when a provisional row is officialized.
+- Official Registration, Duty Code, OUT/IN, Block, Company/MOLIT, Night, INST, T/O and L/D win when a provisional row is officialized. A/L is also authoritative when the source field is blank; blank is never inferred as `N`.
 - New official operating sectors are created with `PENDING USER INPUT` post-flight state unless a pre-existing Master row already contains user input.
 
 ### Original PDF management
@@ -87,6 +87,8 @@ Each confirm also creates a full Google Sheet backup before Master writes. A fai
 ### Deployment requirements
 
 The Next.js route uses `unpdf@1.8.1` and therefore requires Node.js 22 or newer.
+
+`Analyze` is read-only. `Confirm` additionally requires the server-side Vercel environment variable `OFFICIAL_IMPORT_CONFIRM_ENABLED=true`. Leave it unset/false until the Apps Script v0.3 backend is deployed, the feature preview has been validated, and deployment access protection has been reviewed.
 
 The Apps Script deployment now uses `DriveApp` for backup/original-file management. The first deployment of this version may require Google OAuth re-authorization for Drive access. Re-deploy the existing web app only after reviewing the new Drive scope; preserve the current deployment identity, access policy, and `FLIGHT_LOG_API_KEY`.
 
