@@ -6009,7 +6009,7 @@ function compareOfficialMasterRow_(masterRow, official) {
     const before = normalizer(check[1]);
     const after = normalizer(check[2]);
 
-    if (after !== '' && before !== after) {
+    if ((name === 'A/L' || after !== '') && before !== after) {
       changes.push({
         field: name,
         before: before,
