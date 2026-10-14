@@ -7,6 +7,7 @@ export const runtime = "nodejs";
 
 const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL;
 const API_KEY = process.env.FLIGHT_LOG_API_KEY;
+const CONFIRM_ENABLED = process.env.OFFICIAL_IMPORT_CONFIRM_ENABLED === "true";
 
 const MAX_PDF_BYTES = 5 * 1024 * 1024;
 const MAX_PAGES = 30;
@@ -150,7 +151,14 @@ export async function POST(request: NextRequest) {
         source,
         parserWarnings: parsed.warnings,
         preview,
+        confirmEnabled: CONFIRM_ENABLED,
       });
+    }
+
+    if (!CONFIRM_ENABLED) {
+      throw new Error(
+        "Official Import Confirm is disabled on this deployment. Analyze remains read-only."
+      );
     }
 
     if (parsed.warnings.length) {
