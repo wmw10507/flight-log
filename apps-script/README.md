@@ -36,3 +36,58 @@ Local verification: npm test, npm run typecheck, npm run build. Tests use in-mem
 Backend deployed on 2026-10-14 at 10:34 (Asia/Seoul) as Apps Script version 27, retaining the existing deployment ID/URL, execution identity and access settings. Production /api/flight reports backendVersion 0.2.8. A live save of KE164 with its existing user values returned UPDATED for KAL-20261006-KE164-DYG-ICN and official: true. Independent before/after reads of Master A135:BR136 (KE163/KE164, 70 columns each) and Queue A16:N17 were identical. The current Today seven-day window no longer includes KE164; its live History/API and save path were verified, with Today hydration covered by local regression tests.
 
 For future backend deployments, replace that project's Code.gs with this file and retain Index.html. Code.gs already includes getCaptains; the separate getCaptains.gs here is a historical additive snippet and must not be uploaded alongside it. GitHub/Vercel continues to deploy the Next.js app from main.
+
+
+## Official PDF Import v1 (v0.3.0-import-v1)
+
+This branch adds a guarded **Analyze → Preview → Confirm** import path for Korean Air `Flight Log Report` PDFs.
+
+### Data rules
+
+- Preview is read-only.
+- Confirm runs under `ScriptLock` and re-runs Preview before any Master mutation.
+- Existing `OFFICIAL CONFIRMED` rows are idempotent when source-controlled values match.
+- If an existing official value differs from the incoming PDF, the item becomes `MISMATCH` and automatic import is blocked.
+- `SCHEDULE_QUEUE.Master Log ID` is used first when available, including Calendar/Official date-boundary sectors such as KE164.
+- `Duty Code EX` / deadhead / travel evidence remains outside the operating Master. If an excluded sector unexpectedly already has an operating Master row, import is blocked for review.
+- User-owned Approach Type/No., PF/PM override, Flight Comment, Tags, and post-flight completion state are not overwritten by official import.
+- Official Registration, Duty Code, OUT/IN, Block, Company/MOLIT, Night, INST, T/O, L/D and nonblank A/L win when a provisional row is officialized.
+- New official operating sectors are created with `PENDING USER INPUT` post-flight state unless a pre-existing Master row already contains user input.
+
+### Original PDF management
+
+Confirm stores the exact uploaded bytes and validates SHA-256 again inside Apps Script before creating the Drive file.
+
+Target hierarchy:
+
+```text
+FLT DATA/
+  01_OFFICIAL_RECORDS/
+    Korean Air/
+      <year>/
+        Flight Log Report/
+          Import_Staging/
+          Archive_Redundant/
+```
+
+The verified 2026 Flight Log Report folder is used only as the bootstrap anchor; future year folders are resolved/created below the same `Korean Air` parent.
+
+After Master/Queue writes pass read-back reconciliation:
+
+1. the staged PDF moves to the year's active `Flight Log Report` folder,
+2. `DOCUMENT_REGISTER` and `OFFICIAL_IMPORT` are written,
+3. active/archive coverage is recalculated,
+4. only physically present, registered PDFs are allowed to justify archive moves,
+5. the smallest interval set that covers the entire available evidence window is kept active,
+6. redundant PDFs move to `Archive_Redundant`; files are never deleted,
+7. if a coverage gap is detected, no archive moves are made.
+
+Each confirm also creates a full Google Sheet backup before Master writes. A failed import leaves the original in staging, marks the source registration as failed when possible, and retains the backup for recovery.
+
+### Deployment requirements
+
+The Next.js route uses `unpdf@1.8.1` and therefore requires Node.js 22 or newer.
+
+The Apps Script deployment now uses `DriveApp` for backup/original-file management. The first deployment of this version may require Google OAuth re-authorization for Drive access. Re-deploy the existing web app only after reviewing the new Drive scope; preserve the current deployment identity, access policy, and `FLIGHT_LOG_API_KEY`.
+
+Do not upload `getCaptains.gs` separately; `Code.gs` remains the complete backend source.
