@@ -326,3 +326,35 @@ test("coverage gaps prevent archive minimization", () => {
   assert.equal(plan.selected.a, true);
   assert.equal(plan.selected.b, undefined);
 });
+
+
+test("blank official A/L clears a provisional nonblank value without inference", () => {
+  const row = makeMaster();
+  row[27] = "N";
+  const e = env([row], [makeQueue()]);
+
+  const preview = e.run(
+    "previewOfficialImport(" +
+      JSON.stringify({ source, records: [official] }) +
+      ")"
+  );
+
+  assert.equal(
+    preview.items[0].changes.some(
+      (change) =>
+        change.field === "A/L" &&
+        change.before === "N" &&
+        change.after === ""
+    ),
+    true
+  );
+
+  e.run(
+    "applyOfficialToExistingRow_(" +
+      'SpreadsheetApp.openById("x").getSheetByName("FLIGHT_LOG_MASTER"),' +
+      JSON.stringify(preview.items[0]) +
+      ',"SRC-TEST")'
+  );
+
+  assert.equal(row[27], "");
+});
