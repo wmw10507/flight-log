@@ -402,3 +402,33 @@ test("day time derives from block minus night, not MOLIT partial credit", () => 
 
   assert.equal(built.row[19], "=MAX(0,Q2-U2)");
 });
+
+
+test("stale Queue Event ID cannot redirect official import to a different flight", () => {
+  const correct = makeMaster();
+  correct[68] = "evt-correct";
+
+  const wrong = makeMaster();
+  wrong[0] = "KAL-20261006-KE999-ICN-PUS";
+  wrong[4] = "KE999";
+  wrong[5] = "ICN";
+  wrong[6] = "PUS";
+  wrong[7] = "ICN-PUS";
+  wrong[68] = "evt-164";
+
+  const q = makeQueue();
+  q[12] = "";
+
+  const e = env([correct, wrong], [q]);
+  const result = e.run(
+    "previewOfficialImport(" +
+      JSON.stringify({ source, records: [official] }) +
+      ")"
+  );
+
+  assert.equal(result.counts.MATCHED_PROVISIONAL, 1);
+  assert.equal(
+    result.items[0].masterLogId,
+    "KAL-20261006-KE164-DYG-ICN"
+  );
+});
