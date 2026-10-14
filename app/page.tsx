@@ -8,7 +8,15 @@ import {
   type CSSProperties,
   type ReactNode,
 } from "react";
-import OfficialImportPanel from "./official-import-panel";
+import dynamic from "next/dynamic";
+
+const OfficialImportPanel = dynamic(() => import("./official-import-panel"), {
+  loading: () => (
+    <div className="py-20 text-center text-[15px] font-medium text-[var(--muted)]">
+      Loading Official Import…
+    </div>
+  ),
+});
 
 /* =========================================================
    TYPES
