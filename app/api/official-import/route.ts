@@ -56,12 +56,23 @@ async function extractPdf(file: File) {
   if (file.size > MAX_PDF_BYTES) {
     throw new Error("PDF is too large. Maximum size is 5 MB.");
   }
+  if ((file.name || "").length > 180) {
+    throw new Error("PDF filename is too long.");
+  }
 
   const bytes = new Uint8Array(await file.arrayBuffer());
+  const signature = new TextDecoder("ascii").decode(bytes.slice(0, 5));
+  if (signature !== "%PDF-") {
+    throw new Error("The selected file does not contain a valid PDF signature.");
+  }
+
   const sha256 = createHash("sha256").update(bytes).digest("hex");
 
   const pdf = await getDocumentProxy(bytes, {
     maxImageSize: 16_777_216,
+    disableFontFace: true,
+    useSystemFonts: false,
+    verbosity: 0,
   });
 
   try {
