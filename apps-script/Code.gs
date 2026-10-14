@@ -7058,7 +7058,24 @@ function confirmOfficialImportUncached_(payload) {
 
     SpreadsheetApp.flush();
 
-    // Move the exact uploaded original out of staging only after Master writes succeed.
+    // Verify Master/Queue state BEFORE moving any prior evidence files.
+    const verification = buildOfficialImportPreview_({
+      source: source,
+      records: payload.records
+    });
+
+    if (
+      verification.counts.MATCHED_PROVISIONAL !== 0 ||
+      verification.counts.NEW !== 0 ||
+      verification.counts.MISMATCH !== 0
+    ) {
+      throw new Error(
+        'Post-import verification failed. Backup retained: ' +
+        (backup ? backup.url : '')
+      );
+    }
+
+    // Only after data verification succeeds does the exact original leave staging.
     staged.file.moveTo(staged.storage.active);
 
     updateDocumentRegisterStorage_(
@@ -7079,26 +7096,10 @@ function confirmOfficialImportUncached_(payload) {
       backup ? backup.url : ''
     );
 
+    // Redundant originals are archived last. They are never deleted.
     const storage = optimizeOfficialPdfCoverage_(documentSheet);
 
     SpreadsheetApp.flush();
-
-    // Verification: every actionable record must now resolve to OFFICIAL.
-    const verification = buildOfficialImportPreview_({
-      source: source,
-      records: payload.records
-    });
-
-    if (
-      verification.counts.MATCHED_PROVISIONAL !== 0 ||
-      verification.counts.NEW !== 0 ||
-      verification.counts.MISMATCH !== 0
-    ) {
-      throw new Error(
-        'Post-import verification failed. Backup retained: ' +
-        (backup ? backup.url : '')
-      );
-    }
 
     return {
       status: 'IMPORTED',
