@@ -6175,19 +6175,42 @@ function findMasterForOfficial_(masterRows, official, queueMatch) {
 }
 
 
+function sourceRegisterEntry_(row, sheetRow, exactHash) {
+  const verification = String(row[6] || '').trim();
+  const notes = String(row[8] || '');
+  const upper = (verification + ' ' + notes).toUpperCase();
+  const failed =
+    upper.indexOf('IMPORT FAILED') >= 0 ||
+    upper.indexOf('STORAGE=FAILED') >= 0 ||
+    upper.indexOf('STORAGE=IMPORTING') >= 0 ||
+    verification.toUpperCase() === 'IMPORTING';
+
+  return {
+    row: sheetRow,
+    sourceId: String(row[0] || ''),
+    exactHash: !!exactHash,
+    verification: verification,
+    notes: notes,
+    driveFileId: extractDriveFileIdFromNotes_(notes),
+    failed: failed
+  };
+}
+
+
 function findOfficialRegisterSource_(documentRows, source) {
   const coverage = source.coverageFrom + ' to ' + source.coverageTo;
   const hashTag = 'SHA256=' + source.sha256.toLowerCase();
 
+  let exactHashMatch = null;
   let filenameCoverage = null;
 
   for (let i = 0; i < documentRows.length; i++) {
     const row = documentRows[i];
     const notes = String(row[8] || '');
-    const sourceId = String(row[0] || '');
 
     if (notes.toLowerCase().indexOf(hashTag.toLowerCase()) >= 0) {
-      return { row: i + 2, sourceId: sourceId, exactHash: true };
+      exactHashMatch = sourceRegisterEntry_(row, i + 2, true);
+      continue;
     }
 
     if (
@@ -6195,11 +6218,11 @@ function findOfficialRegisterSource_(documentRows, source) {
       String(row[7] || '').trim() === source.fileName &&
       String(row[4] || '').trim() === coverage
     ) {
-      filenameCoverage = { row: i + 2, sourceId: sourceId, exactHash: false };
+      filenameCoverage = sourceRegisterEntry_(row, i + 2, false);
     }
   }
 
-  return filenameCoverage;
+  return exactHashMatch || filenameCoverage;
 }
 
 
@@ -6333,13 +6356,19 @@ function buildOfficialImportPreview_(payload) {
 
   const existingSource = findOfficialRegisterSource_(documentRows, source);
   const actionable = counts.MATCHED_PROVISIONAL + counts.NEW;
-  const alreadyImported = !!existingSource && actionable === 0 && counts.MISMATCH === 0;
+  const alreadyImported =
+    !!existingSource &&
+    !existingSource.failed &&
+    actionable === 0 &&
+    counts.MISMATCH === 0;
 
   return {
     source: source,
     sourceId: officialImportSourceId_(source),
     sourcePreviouslyRegistered: !!existingSource,
     registeredSourceId: existingSource ? existingSource.sourceId : '',
+    retryRegistrationRow: existingSource && existingSource.failed ? existingSource.row : null,
+    retryDriveFileId: existingSource && existingSource.failed ? existingSource.driveFileId : '',
     alreadyImported: alreadyImported,
     counts: counts,
     hasMismatches: counts.MISMATCH > 0,
@@ -6438,6 +6467,34 @@ function createStagedOfficialPdf_(source, base64) {
     file: file,
     storage: storage
   };
+}
+
+
+function reuseRegisteredOfficialPdf_(source, fileId) {
+  if (!fileId) return null;
+
+  try {
+    const file = DriveApp.getFileById(fileId);
+    const bytes = file.getBlob().getBytes();
+    const actualHash = sha256HexBytes_(bytes);
+
+    if (actualHash !== String(source.sha256 || '').toLowerCase()) {
+      return null;
+    }
+
+    const storage = getOfficialStorageFolders_(
+      String(source.coverageTo || '').slice(0, 4)
+    );
+
+    return {
+      id: file.getId(),
+      url: file.getUrl(),
+      file: file,
+      storage: storage
+    };
+  } catch (error) {
+    return null;
+  }
 }
 
 
@@ -6696,10 +6753,27 @@ function appendOfficialImportAudit_(sheet, preview, sourceId, sourceUrl, applied
     '-' +
     preview.source.sha256.slice(0, 8).toUpperCase();
 
+  const existingIds = {};
+  if (sheet.getLastRow() >= 2) {
+    sheet.getRange(2, 1, sheet.getLastRow() - 1, 1)
+      .getDisplayValues()
+      .forEach(function(row) {
+        const id = String(row[0] || '').trim();
+        if (id) existingIds[id] = true;
+      });
+  }
+
+  function appendOnce(row) {
+    const id = String(row[0] || '').trim();
+    if (!id || existingIds[id]) return;
+    sheet.appendRow(row);
+    existingIds[id] = true;
+  }
+
   const matchCount = preview.counts.ALREADY_OFFICIAL;
 
   if (matchCount) {
-    sheet.appendRow([
+    appendOnce([
       prefix + '-VERIFY',
       sourceUrl || sourceId,
       now,
@@ -6746,7 +6820,7 @@ function appendOfficialImportAudit_(sheet, preview, sourceId, sourceUrl, applied
         }).join('; ')
       : item.reason;
 
-    sheet.appendRow([
+    appendOnce([
       prefix + '-' + item.record.flight + '-' + String(item.index + 1),
       sourceUrl || sourceId,
       now,
@@ -7010,16 +7084,40 @@ function confirmOfficialImportUncached_(payload) {
     throw new Error('Required official-import sheets are missing.');
   }
 
-  const sourceId = preview.sourceId;
-  const staged = createStagedOfficialPdf_(source, payload.pdfBase64);
-  const documentRow = appendDocumentRegister_(
-    documentSheet,
-    sourceId,
-    source,
-    staged,
-    'IMPORTING',
-    'Awaiting Master reconciliation.'
-  );
+  const sourceId = preview.registeredSourceId || preview.sourceId;
+  let staged = null;
+  let documentRow = preview.retryRegistrationRow || null;
+
+  if (documentRow && preview.retryDriveFileId) {
+    staged = reuseRegisteredOfficialPdf_(
+      source,
+      preview.retryDriveFileId
+    );
+  }
+
+  if (!staged) {
+    staged = createStagedOfficialPdf_(source, payload.pdfBase64);
+  }
+
+  if (documentRow) {
+    updateDocumentRegisterStorage_(
+      documentSheet,
+      documentRow,
+      source,
+      staged,
+      'IMPORTING',
+      'Retrying prior failed official import.'
+    );
+  } else {
+    documentRow = appendDocumentRegister_(
+      documentSheet,
+      sourceId,
+      source,
+      staged,
+      'IMPORTING',
+      'Awaiting Master reconciliation.'
+    );
+  }
 
   let backup = null;
 
