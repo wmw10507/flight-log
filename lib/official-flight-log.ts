@@ -112,7 +112,9 @@ export function parseKoreanAirFlightLogText(
   const chunks = withBoundaries
     .split("\n")
     .map((value) => value.replace(/\s+/g, " ").trim())
-    .filter((value) => /^20\d{2}-\d{2}-\d{2}\b/.test(value));
+    .filter((value) =>
+      /^20\d{2}-\d{2}-\d{2}\s+HL[A-Z0-9]{4}\b/.test(value)
+    );
 
   const records: OfficialFlightRecord[] = [];
   const warnings: string[] = [];
