@@ -5595,7 +5595,7 @@ function getCaptains() {
 
 
 /* v0.2.6: caches never supply write/identity decisions. */
-const BACKEND_VERSION = '0.3.1-import-v1';
+const BACKEND_VERSION = '0.3.2-import-v1';
 const flightExecution_ = { spreadsheets: {}, masterIndex: null };
 
 function openFlightSpreadsheet_(id) {
@@ -5929,7 +5929,8 @@ function validateOfficialImportPayload_(payload, requirePdf) {
     totalPages: Number(source.totalPages || 0),
     coverageFrom: coverageFrom,
     coverageTo: coverageTo,
-    sectorCount: Number(source.sectorCount || payload.records.length)
+    sectorCount: Number(source.sectorCount || payload.records.length),
+    reportCreatedAt: officialReportCreatedAt_(source)
   };
 }
 
@@ -5939,6 +5940,65 @@ function officialImportSourceId_(source) {
     String(source.coverageTo || '').replace(/-/g, '') +
     '-' +
     String(source.sha256 || '').slice(0, 8).toUpperCase();
+}
+
+function officialReportCreatedAt_(source) {
+  const embedded = String(source.reportCreatedAt || '');
+  const filename = String(source.fileName || '').match(/^Flight Voyage Record Detail(\d{13})\.pdf$/i);
+  const millis = embedded ? Date.parse(embedded) : filename ? Number(filename[1]) : NaN;
+  if (!isFinite(millis)) return '';
+  const iso = new Date(millis).toISOString();
+  return /^20\d{2}-/.test(iso) && iso.slice(0, 10) >= String(source.coverageTo || '') ? iso : '';
+}
+
+function officialMasterSnapshot_(row) {
+  return {
+    sourceId: String(row[MASTER_COL.SOURCE_ID - 1] || ''),
+    date: normalizeDateString(row[MASTER_COL.DATE - 1]),
+    flight: normalizeFlightNo(row[MASTER_COL.FLIGHT - 1]),
+    dep: String(row[MASTER_COL.DEP - 1] || '').trim().toUpperCase(),
+    arr: String(row[MASTER_COL.ARR - 1] || '').trim().toUpperCase(),
+    registration: String(row[MASTER_COL.REG - 1] || '').trim().toUpperCase(),
+    dutyCode: String(row[MASTER_COL.DUTY - 1] || '').trim().toUpperCase(),
+    outGmt: normalizeClock_(row[MASTER_COL.OUT_GMT - 1]),
+    inGmt: normalizeClock_(row[MASTER_COL.IN_GMT - 1]),
+    block: normalizeDuration_(row[MASTER_COL.BLOCK - 1]),
+    companyTime: normalizeDuration_(row[MASTER_COL.COMPANY - 1]),
+    molitTime: normalizeDuration_(row[MASTER_COL.MOLIT - 1]),
+    night: normalizeDuration_(row[MASTER_COL.NIGHT - 1]),
+    inst: normalizeDuration_(row[MASTER_COL.INST - 1]),
+    takeoff: normalizeYesNoBlank(row[MASTER_COL.TAKEOFF - 1]),
+    landing: normalizeYesNoBlank(row[MASTER_COL.LANDING - 1]),
+    autoland: normalizeYesNoBlank(row[MASTER_COL.AUTOLAND - 1])
+  };
+}
+
+function officialRevisionProof_(row, official, source, documentRows) {
+  const previous = officialMasterSnapshot_(row);
+  const sameSector = previous.date === official.date && previous.flight === official.flight &&
+    previous.dep === official.dep && previous.arr === official.arr &&
+    !!previous.registration && previous.registration === official.registration &&
+    !!previous.outGmt && previous.outGmt === official.outGmt &&
+    !!previous.inGmt && previous.inGmt === official.inGmt;
+  const prior = documentRows.filter(function(doc) {
+    return String(doc[0] || '') === previous.sourceId &&
+      String(doc[1] || '') === 'Flight Log Report' &&
+      /Korean Air/i.test(String(doc[2] || '')) &&
+      !sourceRegisterEntry_(doc, 0, false).failed;
+  });
+  if (!sameSector || prior.length !== 1 || !source.reportCreatedAt) return null;
+  const coverage = parseCoverage_(prior[0][4]);
+  if (!coverage || official.date < coverage.from || official.date > coverage.to) return null;
+  const storedStamp = String(prior[0][8] || '').match(/ReportCreatedAt=(\S+)/);
+  const previousCreatedAt = officialReportCreatedAt_({
+    fileName: String(prior[0][7] || ''),
+    reportCreatedAt: storedStamp ? storedStamp[1] : '',
+    coverageTo: coverage.to
+  });
+  if (!previousCreatedAt || source.reportCreatedAt <= previousCreatedAt ||
+      source.sha256 === (String(prior[0][8] || '').match(/SHA256=([a-f0-9]{64})/i) || [])[1]) return null;
+  return { sameSector: true, previousSourceId: previous.sourceId, previousCreatedAt: previousCreatedAt,
+    incomingCreatedAt: source.reportCreatedAt, previous: previous };
 }
 
 
@@ -6310,6 +6370,7 @@ function buildOfficialImportPreview_(payload) {
   const counts = {
     ALREADY_OFFICIAL: 0,
     MATCHED_PROVISIONAL: 0,
+    OFFICIAL_REVISION: 0,
     NEW: 0,
     MISMATCH: 0,
     EXCLUDED: 0
@@ -6353,6 +6414,7 @@ function buildOfficialImportPreview_(payload) {
     let status;
     let reason = '';
     let changes = [];
+    let revision = null;
 
     if (queueResult.ambiguous || masterResult.ambiguous) {
       status = 'MISMATCH';
@@ -6375,8 +6437,11 @@ function buildOfficialImportPreview_(payload) {
 
       if (recordStatus.indexOf('OFFICIAL') >= 0) {
         if (changes.length) {
-          status = 'MISMATCH';
-          reason = 'Existing OFFICIAL values differ from this PDF. Manual review required.';
+          revision = officialRevisionProof_(masterRow, official, source, documentRows);
+          status = revision ? 'OFFICIAL_REVISION' : 'MISMATCH';
+          reason = revision
+            ? 'Same sector confirmed; a newer Korean Air report revises official fields. Previous values will be audited.'
+            : 'Official differences lack verified same-sector/newer-report provenance.';
         } else {
           status = 'ALREADY_OFFICIAL';
           reason = 'Existing official Master values match.';
@@ -6400,6 +6465,7 @@ function buildOfficialImportPreview_(payload) {
       reason: reason,
       record: official,
       changes: changes,
+      revision: revision,
       queueRow: queueMatch ? queueMatch.sheetRow : null,
       queueDate: queueMatch ? normalizeDateString(queueMatch.row[QUEUE_COL.DATE - 1]) : '',
       queueEventId: queueMatch ? String(queueMatch.row[QUEUE_COL.EVENT_ID - 1] || '') : '',
@@ -6412,7 +6478,7 @@ function buildOfficialImportPreview_(payload) {
   });
 
   const existingSource = findOfficialRegisterSource_(documentRows, source);
-  const actionable = counts.MATCHED_PROVISIONAL + counts.NEW;
+  const actionable = counts.MATCHED_PROVISIONAL + counts.NEW + counts.OFFICIAL_REVISION;
   const alreadyImported =
     !!existingSource &&
     !existingSource.failed &&
@@ -6559,6 +6625,7 @@ function officialImportNotes_(source, fileInfo, storage, extra) {
   return [
     source.sectorCount + ' source records.',
     'SHA256=' + source.sha256,
+    source.reportCreatedAt ? 'ReportCreatedAt=' + source.reportCreatedAt : '',
     'DriveFileId=' + (fileInfo && fileInfo.id ? fileInfo.id : ''),
     'URL=' + (fileInfo && fileInfo.url ? fileInfo.url : ''),
     'Storage=' + storage,
@@ -6862,7 +6929,9 @@ function appendOfficialImportAudit_(sheet, preview, sourceId, sourceUrl, applied
     );
 
     const status =
-      item.status === 'MATCHED_PROVISIONAL'
+      item.status === 'OFFICIAL_REVISION'
+        ? 'OFFICIAL REVISION'
+        : item.status === 'MATCHED_PROVISIONAL'
         ? 'OFFICIALIZED'
         : item.status === 'NEW'
         ? 'ADDED'
@@ -6871,7 +6940,9 @@ function appendOfficialImportAudit_(sheet, preview, sourceId, sourceUrl, applied
         : item.status;
 
     const previous =
-      item.masterLogId
+      item.revision
+        ? JSON.stringify(item.revision.previous)
+        : item.masterLogId
         ? 'Existing Master ' + item.masterLogId
         : item.queueRow
         ? 'SCHEDULE_QUEUE only'
@@ -6894,12 +6965,30 @@ function appendOfficialImportAudit_(sheet, preview, sourceId, sourceUrl, applied
       difference,
       status,
       now,
-      item.reason + ' User-owned post-flight fields preserved. Backup: ' + (backupUrl || ''),
+      item.reason + (item.revision ? ' Revision proof=' + JSON.stringify(item.revision) : '') +
+        ' User-owned post-flight fields preserved. Backup: ' + (backupUrl || ''),
       'PDF parser'
     ]);
   });
 }
 
+
+function prepareOfficialRevisionAudit_(sheet, preview, sourceId, sourceUrl, backupUrl) {
+  const existing = sheet.getLastRow() >= 2
+    ? sheet.getRange(2, 1, sheet.getLastRow() - 1, 1).getDisplayValues().map(function(r) { return String(r[0]); })
+    : [];
+  const now = Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'yyyy-MM-dd HH:mm') + ' KST';
+  preview.items.filter(function(item) { return item.status === 'OFFICIAL_REVISION'; }).forEach(function(item) {
+    const id = sourceId + '-REVISION-BEFORE-' + item.index;
+    if (existing.indexOf(id) >= 0) return;
+    sheet.appendRow([id, sourceUrl || sourceId, now, item.masterLogId, 'OFFICIAL REVISION',
+      JSON.stringify(item.record), JSON.stringify(item.revision.previous),
+      JSON.stringify(item.changes), 'REVISION PREPARED', '',
+      'Before Master write. Proof=' + JSON.stringify(item.revision) + ' Backup=' + backupUrl, 'Korean Air Flight Log Report']);
+  });
+  // Audit must be durable before any Master row is changed.
+  SpreadsheetApp.flush();
+}
 
 function parseCoverage_(value) {
   const match = String(value || '').match(/(20\d{2}-\d{2}-\d{2})\s+to\s+(20\d{2}-\d{2}-\d{2})/);
@@ -7188,6 +7277,8 @@ function confirmOfficialImportUncached_(payload) {
   try {
     backup = createOfficialImportBackup_();
 
+    prepareOfficialRevisionAudit_(auditSheet, preview, sourceId, staged.url, backup.url);
+
     const queueRows = queueSheet.getLastRow() >= 2
       ? queueSheet.getRange(2, 1, queueSheet.getLastRow() - 1, 14).getDisplayValues()
       : [];
@@ -7197,7 +7288,7 @@ function confirmOfficialImportUncached_(payload) {
     preview.items.forEach(function(item) {
       let logId = item.masterLogId || '';
 
-      if (item.status === 'MATCHED_PROVISIONAL') {
+      if (item.status === 'MATCHED_PROVISIONAL' || item.status === 'OFFICIAL_REVISION') {
         logId = applyOfficialToExistingRow_(masterSheet, item, sourceId);
       } else if (item.status === 'NEW') {
         logId = appendOfficialMasterRow_(masterSheet, item, sourceId, queueRows);
@@ -7207,6 +7298,7 @@ function confirmOfficialImportUncached_(payload) {
 
       if (
         item.status === 'MATCHED_PROVISIONAL' ||
+        item.status === 'OFFICIAL_REVISION' ||
         item.status === 'NEW' ||
         item.status === 'ALREADY_OFFICIAL'
       ) {
@@ -7228,6 +7320,7 @@ function confirmOfficialImportUncached_(payload) {
 
     if (
       verification.counts.MATCHED_PROVISIONAL !== 0 ||
+      verification.counts.OFFICIAL_REVISION !== 0 ||
       verification.counts.NEW !== 0 ||
       verification.counts.MISMATCH !== 0
     ) {

@@ -100,6 +100,13 @@ async function extractPdf(file: File) {
     }
 
     const parsed = parseKoreanAirFlightLogText(text);
+    const metadata = await pdf.getMetadata();
+    const creation = String((metadata.info as Record<string, unknown>).CreationDate || "").match(
+      /^D:(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})Z$/
+    );
+    const reportCreatedAt = creation
+      ? `${creation[1]}-${creation[2]}-${creation[3]}T${creation[4]}:${creation[5]}:${creation[6]}Z`
+      : "";
     if (parsed.records.length > MAX_RECORDS) {
       throw new Error("Too many flight records were detected.");
     }
@@ -108,6 +115,7 @@ async function extractPdf(file: File) {
       bytes,
       sha256,
       totalPages: extraction.totalPages,
+      reportCreatedAt,
       ...parsed,
     };
   } finally {
@@ -145,6 +153,7 @@ export async function POST(request: NextRequest) {
       coverageFrom: parsed.coverageFrom,
       coverageTo: parsed.coverageTo,
       sectorCount: parsed.records.length,
+      reportCreatedAt: parsed.reportCreatedAt,
     };
 
     if (mode === "analyze") {

@@ -99,3 +99,9 @@ Do not upload `getCaptains.gs` separately; `Code.gs` remains the complete backen
 The generic `/api/flight` bridge permits only existing app actions and rejects all Official Import actions. Official imports use the dedicated route, whose Vercel `OFFICIAL_IMPORT_CONFIRM_ENABLED` flag rejects Confirm before PDF extraction when unset/false.
 
 Apps Script independently requires its own Script Property `OFFICIAL_IMPORT_CONFIRM_ENABLED` to equal `true`. Both Confirm entry points check this before any lock/cache/Sheet/Drive mutation. Missing, false, and other values fail closed. Preview does not require this property. Keep both switches OFF until a separately authorized actual import test.
+
+### Verified official revisions (v0.3.2-import-v1)
+
+Analyze classifies differences as OFFICIAL_REVISION only when the prior Master source uniquely resolves to a registered Korean Air Flight Log Report, date/flight/DEP/ARR/registration/OUT/IN identify the same sector, and the incoming report was generated later. PDF CreationDate is extracted server-side; original JasperReports filename timestamps support legacy registrations. Unknown chronology, stale reports, ambiguous identities and conflicting clocks remain MISMATCH.
+
+Before any revision Master write, Confirm stores the full previous official snapshot, source IDs/timestamps, new values and delta in OFFICIAL_IMPORT and flushes that audit. Audit failure blocks Master mutation. A verified completed revision is additionally recorded as OFFICIAL REVISION. Existing Approach, PFPM overrides, Comment/mirrors and completion inputs remain intact. Confirm re-analyzes under lock and verifies that no actionable revisions remain. Both original PDFs remain retained through the existing coverage-aware archive flow. Deployment and Analyze do not enable either Confirm switch.

@@ -106,7 +106,12 @@ function env(masterRows, queueRows, documentRows = []) {
     const sheetData = data[name];
 
     function valueAt(row, col) {
-      return sheetData[row - 2]?.[col - 1] ?? "";
+      const value = sheetData[row - 2]?.[col - 1] ?? "";
+      if (typeof value === "number" && [17,18,19,21,22].includes(col)) {
+        const mins = Math.round(value * 1440);
+        return Math.floor(mins / 60) + ":" + String(mins % 60).padStart(2, "0");
+      }
+      return value;
     }
 
     return {
@@ -293,6 +298,104 @@ test("deadhead EX is excluded and never becomes a new operating Master sector", 
 
   assert.equal(result.counts.EXCLUDED, 1);
   assert.equal(result.counts.NEW, 0);
+});
+
+function revisionFixture(overrides = {}) {
+  const row = makeMaster("OFFICIAL CONFIRMED");
+  row[39] = "SRC-KAL-FLIGHTLOG-20261006";
+  row[25] = "Y"; row[26] = "Y"; row[27] = "N";
+  const document = [row[39], "Flight Log Report", "Korean Air (source report)", "2026-10-06",
+    "2026-04-12 to 2026-10-06", "", "SOURCE PROVIDED", "Flight Voyage Record Detail1791315013561.pdf", ""];
+  const incoming = { ...source, fileName: "Flight Voyage Record Detail1791955383212.pdf",
+    coverageFrom: "2026-10-06", coverageTo: "2026-10-06", ...overrides };
+  return { row, document, incoming };
+}
+
+test("verified newer company report is OFFICIAL REVISION; preview is read-only", () => {
+  const f = revisionFixture();
+  const e = env([f.row], [makeQueue()], [f.document]);
+  const p = e.run("previewOfficialImport(" + JSON.stringify({ source: f.incoming, records: [official] }) + ")");
+  assert.equal(p.counts.OFFICIAL_REVISION, 1);
+  assert.equal(p.counts.MISMATCH, 0);
+  assert.equal(p.hasMismatches, false);
+  assert.equal(p.alreadyImported, false);
+  assert.deepEqual(p.items[0].changes.map(c => [c.field, c.before, c.after]),
+    [["T/O","Y","N"],["L/D","Y","N"],["A/L","N",""]]);
+  assert.equal(p.items[0].revision.previous.sourceId, f.row[39]);
+  assert.deepEqual(e.writes, []);
+});
+
+test("older/equal reports, missing provenance and mismatched linked identity stay blocked", () => {
+  for (const mode of ["older", "equal", "missing", "duplicate", "wrong-route", "different-clock", "failed"]) {
+    const f = revisionFixture(mode === "older" ? { fileName: "Flight Voyage Record Detail1790837896021.pdf" }
+      : mode === "equal" ? { fileName: "Flight Voyage Record Detail1791315013561.pdf" } : {});
+    if (mode === "wrong-route") f.row[6] = "PUS";
+    if (mode === "different-clock") f.row[14] = "15:25";
+    if (mode === "failed") f.document[6] = "IMPORT FAILED";
+    const docs = mode === "missing" ? [] : mode === "duplicate" ? [f.document, [...f.document]] : [f.document];
+    const e = env([f.row], [makeQueue()], docs);
+    const p = e.run("previewOfficialImport(" + JSON.stringify({ source: f.incoming, records: [official] }) + ")");
+    assert.equal(p.counts.MISMATCH, 1, mode);
+    assert.equal(p.counts.OFFICIAL_REVISION, 0, mode);
+    assert.deepEqual(e.writes, []);
+  }
+});
+
+test("revision pre-audit retains blank transitions and provenance before writes; user fields survive", () => {
+  const f = revisionFixture();
+  f.row[44] = "PF"; f.row[54] = "user mirror"; f.row[55] = "ILS Z 33R"; f.row[56] = "1";
+  const userColumns = [2,3,8,9,44,54,55,56,65];
+  const before = userColumns.map(i => f.row[i]);
+  const e = env([f.row], [makeQueue()], [f.document]);
+  const p = e.run("previewOfficialImport(" + JSON.stringify({ source:f.incoming,records:[official] }) + ")");
+  e.ctx.prepareOfficialRevisionAudit_(e.ctx.SpreadsheetApp.openById("x").getSheetByName("OFFICIAL_IMPORT"), p, p.sourceId, "pdf-url", "backup-url");
+  assert.deepEqual(userColumns.map(i => f.row[i]), before);
+  assert.equal(f.row[25], "Y");
+  assert.equal(e.data.OFFICIAL_IMPORT[0][8], "REVISION PREPARED");
+  assert.equal(JSON.parse(e.data.OFFICIAL_IMPORT[0][6]).takeoff, "Y");
+  assert.equal(JSON.parse(e.data.OFFICIAL_IMPORT[0][5]).takeoff, "N");
+  const master = e.ctx.SpreadsheetApp.openById("x").getSheetByName("FLIGHT_LOG_MASTER");
+  e.ctx.applyOfficialToExistingRow_(master, p.items[0], p.sourceId);
+  assert.deepEqual(userColumns.map(i => f.row[i]), before);
+  assert.deepEqual([f.row[25],f.row[26],f.row[27]], ["N","N",""]);
+  e.ctx.appendOfficialImportAudit_(e.ctx.SpreadsheetApp.openById("x").getSheetByName("OFFICIAL_IMPORT"), p, p.sourceId, "pdf-url", {0:f.row[0]}, "backup-url");
+  const audited = e.data.OFFICIAL_IMPORT.find(r => r[8] === "OFFICIAL REVISION");
+  assert.ok(audited);
+  assert.equal(JSON.parse(audited[6]).autoland, "N");
+  assert.match(audited[7], /A\/L N → blank/);
+  const rerun = e.run("previewOfficialImport(" + JSON.stringify({source:f.incoming,records:[official]}) + ")");
+  assert.equal(rerun.counts.OFFICIAL_REVISION, 0);
+  assert.equal(rerun.counts.ALREADY_OFFICIAL, 1);
+});
+
+test("revision audit failure stops before changing Master", () => {
+  const f = revisionFixture();
+  const e = env([f.row], [makeQueue()], [f.document]);
+  const p = e.run("previewOfficialImport(" + JSON.stringify({source:f.incoming,records:[official]}) + ")");
+  const snapshot = [...f.row];
+  assert.throws(() => e.ctx.prepareOfficialRevisionAudit_({getLastRow:()=>1,appendRow(){throw Error("audit failed");}},p,p.sourceId,"pdf","backup"),/audit failed/);
+  assert.deepEqual(f.row,snapshot);
+});
+
+test("Confirm orchestration requires durable revision audit before calling Master mutation", () => {
+  const f = revisionFixture();
+  const e = env([f.row], [makeQueue()], [f.document]);
+  const snapshot = [...f.row];
+  e.ctx.PropertiesService.getScriptProperties().setProperty("OFFICIAL_IMPORT_CONFIRM_ENABLED","true");
+  const originalOpen = e.ctx.SpreadsheetApp.openById;
+  const ss = originalOpen("x");
+  e.ctx.openFlightSpreadsheet_ = () => ({getSheetByName:name => name==="OFFICIAL_IMPORT"
+    ? {getLastRow:()=>1,appendRow(){throw Error("audit unavailable");}}
+    : ss.getSheetByName(name)});
+  e.ctx.createStagedOfficialPdf_ = () => ({id:"file",url:"pdf",file:{},storage:{}});
+  e.ctx.appendDocumentRegister_ = () => 2;
+  e.ctx.updateDocumentRegisterStorage_ = () => {};
+  e.ctx.createOfficialImportBackup_ = () => ({url:"backup"});
+  let writes=0;
+  e.ctx.applyOfficialToExistingRow_ = () => {writes++;};
+  assert.throws(()=>e.ctx.confirmOfficialImportUncached_({source:f.incoming,records:[official],pdfBase64:"AA=="}),/audit unavailable/);
+  assert.equal(writes,0);
+  assert.deepEqual(f.row,snapshot);
 });
 
 test("rolling coverage keeps the older report when the newest report drops the first date", () => {

@@ -5,6 +5,7 @@ import { useMemo, useState } from "react";
 type ImportStatus =
   | "ALREADY_OFFICIAL"
   | "MATCHED_PROVISIONAL"
+  | "OFFICIAL_REVISION"
   | "NEW"
   | "MISMATCH"
   | "EXCLUDED";
@@ -90,6 +91,7 @@ type ConfirmResponse = {
 const labels: Record<ImportStatus, string> = {
   ALREADY_OFFICIAL: "Already official",
   MATCHED_PROVISIONAL: "Provisional → Official",
+  OFFICIAL_REVISION: "Official revision",
   NEW: "New official",
   MISMATCH: "Mismatch",
   EXCLUDED: "Excluded",
@@ -284,7 +286,7 @@ export default function OfficialImportPanel() {
               </div>
             </div>
 
-            <div className="mt-5 grid grid-cols-2 gap-3 sm:grid-cols-5">
+            <div className="mt-5 grid grid-cols-2 gap-3 sm:grid-cols-6">
               <Stat
                 label="Matched"
                 value={analysis.preview.counts.ALREADY_OFFICIAL}
@@ -298,6 +300,11 @@ export default function OfficialImportPanel() {
               <Stat
                 label="New"
                 value={analysis.preview.counts.NEW}
+                tone="warn"
+              />
+              <Stat
+                label="Revision"
+                value={analysis.preview.counts.OFFICIAL_REVISION || 0}
                 tone="warn"
               />
               <Stat
