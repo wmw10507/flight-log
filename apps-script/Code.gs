@@ -1,0 +1,5786 @@
+// Flight LOG v0.2.7 selective reads — full replacement
+// Flight LOG Code.gs — v0.2.4 Data Priority Guard
+// Data priority: Official Flight Log > Post-flight actual > FLT SCH actual > FLT SCH scheduled
+// 2026-10-06
+//
+// Changes:
+// 1) Queue LATEST OUT/IN is protected once a row becomes FLOWN/PROVISIONAL,
+//    MASTER/OFFICIAL, DEADHEAD/TRAVEL, or CANCELLED.
+// 2) Master actual/official OUT_GMT / IN_GMT remain protected.
+// 3) Provisional creation stores calendar-derived times only in CAL_OUT_KST / CAL_IN_KST.
+// 4) Duplicate jsonResponse_ definition removed.
+//
+// NOTE: Taxi eligibility is not in this file. It belongs to the separate FLT OPS sync script.
+
+const CONFIG = {
+  SPREADSHEET_ID: '1tD003yx6BtwFIquQygztZvd4vppcBrT6RSPkMLOYkhs',
+
+  MASTER_SHEET: 'FLIGHT_LOG_MASTER',
+  QUEUE_SHEET: 'SCHEDULE_QUEUE',
+
+  FLT_SCH_CALENDAR_ID:
+    '1637e934f5b745efb643b55970f2ef6d34dfe9fffb30013364aeaacf0fc5e297@group.calendar.google.com',
+
+  TIMEZONE: 'Asia/Seoul',
+
+  APP_PAST_DAYS: 7,
+  APP_FUTURE_DAYS: 45,
+
+  SYNC_PAST_DAYS: 7,
+  SYNC_FUTURE_DAYS: 45,
+
+  ROTATION_MAX_GAP_HOURS: 36,
+  ROTATION_MAX_LEGS: 4,
+
+  RECENCY_DAYS: 90,
+  RECENCY_REQUIRED: 3,
+
+  STANDARD_TYPE_32S: 'A321-272NX'
+};
+
+
+/* =========================================================
+   COLUMN MAP
+========================================================= */
+
+const MASTER_COL = {
+  LOG_ID: 1,
+  DATE: 2,
+  APP_TYPE: 3,
+  APP_NO: 4,
+  FLIGHT: 5,
+  DEP: 6,
+  ARR: 7,
+  ROUTE: 8,
+  PFPM_OVERRIDE: 9,
+  COMMENT: 10,
+
+  REG: 11,
+  DUTY: 12,
+  POSITION: 13,
+  PIC: 14,
+
+  OUT_GMT: 15,
+  IN_GMT: 16,
+  BLOCK: 17,
+
+  COMPANY: 18,
+  MOLIT: 19,
+
+  DAY: 20,
+  NIGHT: 21,
+  INST: 22,
+  IFR: 23,
+  FAA_ACTUAL: 24,
+  SIM_INST: 25,
+
+  TAKEOFF: 26,
+  LANDING: 27,
+  AUTOLAND: 28,
+  PFPM: 29,
+
+  PIC_TIME: 30,
+  SIC: 31,
+  PICUS: 32,
+
+  SAFETY: 33,
+  SAFETY_CREDIT: 34,
+
+  TRAINING: 35,
+  DOM_INTL: 36,
+
+  CUM_BLOCK: 37,
+  CUM_CREDIT: 38,
+
+  VERIFICATION: 39,
+  SOURCE_ID: 40,
+  REMARKS: 41,
+  OP_TYPE: 42,
+  CREW: 43,
+  CREDIT_BASIS: 44,
+
+  PFPM_MIRROR: 45,
+
+  PIC_STATUS: 53,
+  CREW_SOURCE: 54,
+  COMMENT_MIRROR: 55,
+  APP_TYPE_MIRROR: 56,
+  APP_NO_MIRROR: 57,
+
+  MONTH: 59,
+  OPERATOR: 60,
+  TYPE_RAW: 61,
+  STANDARD_TYPE: 62,
+  BT_SOURCE: 63,
+  RECORD_STATUS: 64,
+  INBOX_NOTE: 65,
+  POSTFLIGHT_STATUS: 66,
+
+  CAL_OUT_KST: 67,
+  CAL_IN_KST: 68,
+  EVENT_ID: 69,
+  SYNC_NOTE: 70
+};
+
+
+const QUEUE_COL = {
+  EVENT_ID: 1,
+  DATE: 2,
+  FLIGHT: 3,
+  DEP: 4,
+  ARR: 5,
+  ROUTE: 6,
+
+  ORIGINAL_OUT: 7,
+  ORIGINAL_IN: 8,
+
+  LATEST_OUT: 9,
+  LATEST_IN: 10,
+
+  STATUS: 11,
+  MEMO: 12,
+  MASTER_LOG_ID: 13,
+  SOURCE: 14
+};
+
+
+/* =========================================================
+   WEB APP
+========================================================= */
+
+function doGet() {
+  return HtmlService
+    .createHtmlOutputFromFile('Index')
+    .setTitle('Flight LOG')
+    .setXFrameOptionsMode(
+      HtmlService.XFrameOptionsMode.ALLOWALL
+    );
+}
+
+
+/* =========================================================
+   APP DATA
+========================================================= */
+
+function getAppData() {
+
+  const flights = getQueueFlights({ readOnly: true });
+
+  const now = new Date();
+
+  const pastLimit =
+    new Date(
+      now.getTime() -
+      CONFIG.APP_PAST_DAYS *
+      24 *
+      60 *
+      60 *
+      1000
+    );
+
+
+  const pastFlights =
+    flights
+      .filter(
+        f =>
+          f.completed &&
+          f.inDate &&
+          f.inDate >= pastLimit
+      )
+      .sort(
+        (a, b) => {
+
+          const aPending =
+            a.postFlightStatus !==
+            'COMPLETE';
+
+          const bPending =
+            b.postFlightStatus !==
+            'COMPLETE';
+
+          if (
+            aPending !== bPending
+          ) {
+            return aPending
+              ? -1
+              : 1;
+          }
+
+          return (
+            b.inDate.getTime() -
+            a.inDate.getTime()
+          );
+        }
+      );
+
+
+  const futureFlights =
+    flights
+      .filter(
+        f =>
+          f.outDate &&
+          f.outDate > now &&
+          !f.completed
+      )
+      .sort(
+        (a, b) =>
+          a.outDate.getTime() -
+          b.outDate.getTime()
+      );
+
+
+  const upcomingRotation =
+    buildNextRotation(
+      futureFlights
+    );
+
+
+  let selectedEventId = '';
+
+  const pending =
+    pastFlights.find(
+      f =>
+        f.postFlightStatus !==
+        'COMPLETE'
+    );
+
+  if (pending) {
+
+    selectedEventId =
+      pending.eventId;
+
+  } else if (
+    pastFlights.length
+  ) {
+
+    selectedEventId =
+      pastFlights[0].eventId;
+
+  } else if (
+    upcomingRotation.length
+  ) {
+
+    selectedEventId =
+      upcomingRotation[0].eventId;
+  }
+
+
+  return {
+    pastFlights:
+      pastFlights.map(cleanFlightForClient),
+
+    upcomingRotation:
+      upcomingRotation.map(cleanFlightForClient),
+
+    selectedEventId:
+      selectedEventId
+  };
+}
+
+
+/* =========================================================
+   QUEUE → APP
+========================================================= */
+
+function getQueueFlights(readOptions) {
+
+  const ss =
+    openFlightSpreadsheet_(
+      CONFIG.SPREADSHEET_ID
+    );
+
+  const sheet =
+    ss.getSheetByName(
+      CONFIG.QUEUE_SHEET
+    );
+
+  const lastRow =
+    sheet.getLastRow();
+
+  if (
+    lastRow < 2
+  ) {
+    return [];
+  }
+
+
+  const rows =
+    sheet
+      .getRange(
+        2,
+        1,
+        lastRow - 1,
+        14
+      )
+      .getDisplayValues();
+
+
+  const masterIndex = readOptions && readOptions.readOnly
+    ? buildMasterIndexUncached_({ queueRows: rows })
+    : buildMasterIndex();
+
+
+  const now =
+    new Date();
+
+
+  const flights = [];
+
+
+  rows.forEach(
+    (row, idx) => {
+
+      const status =
+        String(
+          row[
+            QUEUE_COL.STATUS - 1
+          ] || ''
+        ).toUpperCase();
+
+
+      if (
+        status.includes('CANCELLED') ||
+        status.includes('DEADHEAD') ||
+        status.includes('TRAVEL')
+      ) {
+        return;
+      }
+
+
+      const date =
+        normalizeDateString(
+          row[
+            QUEUE_COL.DATE - 1
+          ]
+        );
+
+
+      const flight =
+        normalizeFlightNo(
+          row[
+            QUEUE_COL.FLIGHT - 1
+          ]
+        );
+
+
+      const dep =
+        String(
+          row[
+            QUEUE_COL.DEP - 1
+          ] || ''
+        ).trim().toUpperCase();
+
+
+      const arr =
+        String(
+          row[
+            QUEUE_COL.ARR - 1
+          ] || ''
+        ).trim().toUpperCase();
+
+
+      if (
+        !date ||
+        !flight ||
+        !dep ||
+        !arr
+      ) {
+        return;
+      }
+
+
+      const outStr =
+        row[
+          QUEUE_COL.LATEST_OUT - 1
+        ]
+        ||
+        row[
+          QUEUE_COL.ORIGINAL_OUT - 1
+        ];
+
+
+      const inStr =
+        row[
+          QUEUE_COL.LATEST_IN - 1
+        ]
+        ||
+        row[
+          QUEUE_COL.ORIGINAL_IN - 1
+        ];
+
+
+      const outDate =
+        parseKstDateTime(
+          outStr
+        );
+
+
+      const inDate =
+        parseKstDateTime(
+          inStr
+        );
+
+
+      const key =
+        makeFlightKey(
+          date,
+          flight,
+          dep,
+          arr
+        );
+
+
+      const master =
+        findMasterForQueue_(
+          masterIndex,
+          {
+            masterLogId: row[QUEUE_COL.MASTER_LOG_ID - 1],
+            date: date,
+            flight: flight,
+            dep: dep,
+            arr: arr,
+            eventId:
+              row[
+                QUEUE_COL.EVENT_ID - 1
+              ],
+            out: outStr
+          }
+        ) ||
+        null;
+
+
+      const effectiveOutStr =
+        master && master.calOutKst
+          ? master.calOutKst
+          : outStr;
+
+
+      const effectiveInStr =
+        master && master.calInKst
+          ? master.calInKst
+          : inStr;
+
+
+      const effectiveOutDate =
+        parseKstDateTime(
+          effectiveOutStr
+        );
+
+
+      const effectiveInDate =
+        parseKstDateTime(
+          effectiveInStr
+        );
+
+
+      const memo =
+        row[
+          QUEUE_COL.MEMO - 1
+        ] || '';
+
+
+      const crew =
+        parseCrewMemo(
+          memo
+        );
+
+
+      const recordStatus =
+        master
+          ? master.recordStatus
+          : '';
+
+
+      const postFlightStatus =
+        master
+          ? (
+              master.postFlightStatus ||
+              'PENDING USER INPUT'
+            )
+          : 'PENDING USER INPUT';
+
+
+      flights.push({
+
+        queueRow:
+          idx + 2,
+
+        eventId:
+          row[
+            QUEUE_COL.EVENT_ID - 1
+          ],
+
+        date:
+          date,
+
+        officialDate: master ? master.date : '',
+        outGmt: master ? master.outGmt : '',
+        inGmt: master ? master.inGmt : '',
+        company: master ? master.company : '',
+        molit: master ? master.molit : '',
+
+        flight:
+          flight,
+
+        dep:
+          dep,
+
+        arr:
+          arr,
+
+        route:
+          dep + '-' + arr,
+
+        out:
+          effectiveOutStr,
+
+        in:
+          effectiveInStr,
+
+        outDate:
+          effectiveOutDate,
+
+        inDate:
+          effectiveInDate,
+
+        outDisplay:
+          (master && masterTimeToKst_(master.outGmt)) || timeFromDateTimeString(
+            effectiveOutStr
+          ),
+
+        inDisplay:
+          (master && masterTimeToKst_(master.inGmt)) || timeFromDateTimeString(
+            effectiveInStr
+          ),
+
+        block:
+          (master && master.block) || calcBlockTime(
+            effectiveOutDate,
+            effectiveInDate
+          ),
+
+        completed:
+          !!(
+            effectiveInDate &&
+            effectiveInDate <= now
+          ),
+
+        status:
+          status,
+
+        source:
+          row[
+            QUEUE_COL.SOURCE - 1
+          ] || '',
+
+        masterLogId:
+          master
+            ? master.logId
+            : (
+                row[
+                  QUEUE_COL.MASTER_LOG_ID - 1
+                ] || ''
+              ),
+
+        recordStatus:
+          recordStatus,
+
+        official:
+          String(
+            recordStatus
+          )
+            .toUpperCase()
+            .includes(
+              'OFFICIAL'
+            ),
+
+        postFlightStatus:
+          postFlightStatus,
+
+        pfpmOverride:
+          master
+            ? master.pfpmOverride
+            : '',
+
+        approachType:
+          master
+            ? master.approachType
+            : '',
+
+        approachNo:
+          master
+            ? master.approachNo
+            : '',
+
+        comment:
+          master
+            ? master.comment
+            : '',
+
+        takeoff:
+          master
+            ? master.takeoff
+            : '',
+
+        landing:
+          master
+            ? master.landing
+            : '',
+
+        pic:
+          master && master.pic
+            ? master.pic
+            : crew.pic,
+
+        role:
+          master && master.position
+            ? master.position
+            : crew.role,
+
+        safetyPilot:
+          master
+            ? master.safetyPilot
+            : crew.safetyPilot,
+
+        fdt:
+          crew.fdt,
+
+        crewType:
+          master && master.crew
+            ? master.crew
+            : crew.crewType
+      });
+    }
+  );
+
+
+  return flights;
+}
+
+
+/* =========================================================
+   MASTER INDEX
+========================================================= */
+
+function buildMasterIndexUncached_(selection) {
+
+  const ss =
+    openFlightSpreadsheet_(
+      CONFIG.SPREADSHEET_ID
+    );
+
+  const sheet =
+    ss.getSheetByName(
+      CONFIG.MASTER_SHEET
+    );
+
+  const lastRow =
+    sheet.getLastRow();
+
+  if (
+    lastRow < 2
+  ) {
+    return {};
+  }
+
+
+  const rows =
+    readMasterRows_(sheet, lastRow, 70, selection);
+
+
+  const index = {};
+  // Keep every physical row by Log ID, even when legacy tuple keys collide.
+  // Non-enumerable so existing reconciliation code still sees only tuple entries.
+  Object.defineProperty(index, 'byLogId', { value: Object.create(null) });
+
+
+  rows.forEach(
+    (row, i) => {
+
+      const date =
+        normalizeDateString(
+          row[
+            MASTER_COL.DATE - 1
+          ]
+        );
+
+
+      const flight =
+        normalizeFlightNo(
+          row[
+            MASTER_COL.FLIGHT - 1
+          ]
+        );
+
+
+      const dep =
+        String(
+          row[
+            MASTER_COL.DEP - 1
+          ] || ''
+        ).trim().toUpperCase();
+
+
+      const arr =
+        String(
+          row[
+            MASTER_COL.ARR - 1
+          ] || ''
+        ).trim().toUpperCase();
+
+
+      if (
+        !date ||
+        !flight ||
+        !dep ||
+        !arr
+      ) {
+        return;
+      }
+
+
+      const key =
+        makeFlightKey(
+          date,
+          flight,
+          dep,
+          arr
+        );
+
+
+      const record = {
+
+        sheetRow:
+          i + 2,
+
+        date:
+          date,
+
+        flight:
+          flight,
+
+        dep:
+          dep,
+
+        arr:
+          arr,
+
+        logId:
+          row[
+            MASTER_COL.LOG_ID - 1
+          ],
+
+        approachType:
+          row[
+            MASTER_COL.APP_TYPE - 1
+          ],
+
+        approachNo:
+          row[
+            MASTER_COL.APP_NO - 1
+          ],
+
+        pfpmOverride:
+          row[
+            MASTER_COL.PFPM_OVERRIDE - 1
+          ],
+
+        comment:
+          row[
+            MASTER_COL.COMMENT - 1
+          ],
+
+        position:
+          row[
+            MASTER_COL.POSITION - 1
+          ],
+
+        pic:
+          row[
+            MASTER_COL.PIC - 1
+          ],
+
+        takeoff:
+          normalizeYesNoBlank(
+            row[
+              MASTER_COL.TAKEOFF - 1
+            ]
+          ),
+
+        landing:
+          normalizeYesNoBlank(
+            row[
+              MASTER_COL.LANDING - 1
+            ]
+          ),
+
+        safetyPilot:
+          normalizeYesNoBlank(
+            row[
+              MASTER_COL.SAFETY - 1
+            ]
+          ) === 'Y',
+
+        crew:
+          row[
+            MASTER_COL.CREW - 1
+          ],
+
+        recordStatus:
+          row[
+            MASTER_COL.RECORD_STATUS - 1
+          ],
+
+        postFlightStatus:
+          row[
+            MASTER_COL.POSTFLIGHT_STATUS - 1
+          ],
+
+        eventId:
+          row[
+            MASTER_COL.EVENT_ID - 1
+          ],
+
+        calOutKst:
+          row[
+            MASTER_COL.CAL_OUT_KST - 1
+          ],
+
+        calInKst:
+          row[
+            MASTER_COL.CAL_IN_KST - 1
+          ],
+        outGmt: row[MASTER_COL.OUT_GMT - 1],
+        inGmt: row[MASTER_COL.IN_GMT - 1],
+        block: row[MASTER_COL.BLOCK - 1],
+        company: row[MASTER_COL.COMPANY - 1],
+        molit: row[MASTER_COL.MOLIT - 1]
+      };
+      index[key] = record;
+      const logId = String(record.logId || '').trim();
+      if (logId) {
+        if (!index.byLogId[logId]) index.byLogId[logId] = [];
+        index.byLogId[logId].push(record);
+      }
+    }
+  );
+
+
+  return index;
+}
+
+
+
+/* =========================================================
+   MASTER IDENTITY / EFFECTIVE MATCHING
+========================================================= */
+
+// Shared by Today hydration and SAVE & DONE. Queue ID is authoritative.
+// A missing/duplicate referenced ID must never redirect to a different record.
+function findMasterForQueue_(masterIndex, flight) {
+  const logId = String(flight.masterLogId || '').trim();
+  if (logId) {
+    const matches = masterIndex.byLogId && masterIndex.byLogId[logId];
+    return matches && matches.length === 1 ? matches[0] : null;
+  }
+  const key = makeFlightKey(flight.date, flight.flight, flight.dep, flight.arr);
+  return key && masterIndex[key] || null;
+}
+
+// Today clocks remain KST; official date is kept separately, never inferred
+// from a clock-only GMT value or written back to either date column.
+function masterTimeToKst_(value) {
+  const match = String(value || '').trim().match(/^(\d{1,2}):(\d{2})(?::\d{2})?$/);
+  if (!match || Number(match[1]) > 23 || Number(match[2]) > 59) return '';
+  return String((Number(match[1]) + 9) % 24).padStart(2, '0') + ':' + match[2];
+}
+
+function findExistingMasterByIdentity(
+  masterIndex,
+  flight
+) {
+
+  if (
+    !masterIndex ||
+    !flight
+  ) {
+    return null;
+  }
+
+
+  const eventId =
+    String(
+      flight.eventId || ''
+    ).trim();
+
+
+  if (
+    eventId
+  ) {
+
+    const byEventId =
+      Object.keys(
+        masterIndex
+      )
+        .map(
+          key =>
+            masterIndex[
+              key
+            ]
+        )
+        .find(
+          row =>
+            String(
+              row.eventId || ''
+            ).trim() ===
+              eventId
+        );
+
+
+    if (
+      byEventId
+    ) {
+      return byEventId;
+    }
+  }
+
+
+  const date =
+    normalizeDateString(
+      flight.date
+    );
+
+
+  const flightNo =
+    normalizeFlightNo(
+      flight.flight ||
+      flight.flightNo
+    );
+
+
+  const dep =
+    String(
+      flight.dep || ''
+    )
+      .trim()
+      .toUpperCase();
+
+
+  const arr =
+    String(
+      flight.arr || ''
+    )
+      .trim()
+      .toUpperCase();
+
+
+  const exactKey =
+    makeFlightKey(
+      date,
+      flightNo,
+      dep,
+      arr
+    );
+
+
+  if (
+    exactKey &&
+    masterIndex[
+      exactKey
+    ]
+  ) {
+    return masterIndex[
+      exactKey
+    ];
+  }
+
+
+  const candidates =
+    Object.keys(
+      masterIndex
+    )
+      .map(
+        key =>
+          masterIndex[
+            key
+          ]
+      )
+      .filter(
+        row =>
+          normalizeFlightNo(
+            row.flight
+          ) ===
+            flightNo
+          &&
+          String(
+            row.dep || ''
+          ).toUpperCase() ===
+            dep
+          &&
+          String(
+            row.arr || ''
+          ).toUpperCase() ===
+            arr
+          &&
+          adjacentCalendarDate(
+            row.date,
+            date
+          )
+      );
+
+
+  /*
+   * Auto-merge only if unambiguous.
+   */
+  if (
+    candidates.length === 1
+  ) {
+    return candidates[0];
+  }
+
+
+  return null;
+}
+
+
+function adjacentCalendarDate(
+  a,
+  b
+) {
+
+  a =
+    normalizeDateString(
+      a
+    );
+
+
+  b =
+    normalizeDateString(
+      b
+    );
+
+
+  if (
+    !a ||
+    !b
+  ) {
+    return false;
+  }
+
+
+  const da =
+    new Date(
+      a +
+      'T00:00:00Z'
+    );
+
+
+  const db =
+    new Date(
+      b +
+      'T00:00:00Z'
+    );
+
+
+  const diffDays =
+    Math.abs(
+      da.getTime() -
+      db.getTime()
+    )
+    /
+    (
+      24 *
+      60 *
+      60 *
+      1000
+    );
+
+
+  return (
+    diffDays === 1
+  );
+}
+
+
+/* =========================================================
+   NEXT ROTATION
+========================================================= */
+
+function buildNextRotation(
+  futureFlights
+) {
+
+  if (
+    !futureFlights ||
+    futureFlights.length === 0
+  ) {
+    return [];
+  }
+
+
+  const rotation = [
+    futureFlights[0]
+  ];
+
+
+  const originalOrigin =
+    futureFlights[0].dep;
+
+
+  for (
+    let i = 1;
+    i < futureFlights.length;
+    i++
+  ) {
+
+    if (
+      rotation.length >=
+      CONFIG.ROTATION_MAX_LEGS
+    ) {
+      break;
+    }
+
+
+    const previous =
+      rotation[
+        rotation.length - 1
+      ];
+
+
+    const candidate =
+      futureFlights[i];
+
+
+    if (
+      candidate.dep !==
+      previous.arr
+    ) {
+      continue;
+    }
+
+
+    const gapHours =
+      (
+        candidate.outDate.getTime() -
+        previous.inDate.getTime()
+      )
+      /
+      (
+        60 *
+        60 *
+        1000
+      );
+
+
+    if (
+      gapHours < 0 ||
+      gapHours >
+      CONFIG.ROTATION_MAX_GAP_HOURS
+    ) {
+      continue;
+    }
+
+
+    rotation.push(
+      candidate
+    );
+
+
+    if (
+      candidate.arr ===
+      originalOrigin
+    ) {
+      break;
+    }
+  }
+
+
+  return rotation;
+}
+
+
+/* =========================================================
+   SAVE POST-FLIGHT
+========================================================= */
+
+function savePostFlightUncached_(
+  payload
+) {
+
+  const lock =
+    LockService.getScriptLock();
+
+  lock.waitLock(
+    30000
+  );
+
+
+  try {
+
+    if (
+      !payload ||
+      !payload.eventId
+    ) {
+      throw new Error(
+        'Flight selection is missing.'
+      );
+    }
+
+
+    const flights =
+      getQueueFlights();
+
+
+    const flight =
+      flights.find(
+        f =>
+          String(f.eventId) ===
+          String(payload.eventId)
+      );
+
+
+    if (
+      !flight
+    ) {
+      throw new Error(
+        'Flight not found in SCHEDULE_QUEUE.'
+      );
+    }
+
+
+    if (
+      !flight.completed
+    ) {
+      throw new Error(
+        'Future flights cannot be saved as completed.'
+      );
+    }
+
+
+    const ss =
+      openFlightSpreadsheet_(
+        CONFIG.SPREADSHEET_ID
+      );
+
+
+    const masterSheet =
+      ss.getSheetByName(
+        CONFIG.MASTER_SHEET
+      );
+
+
+    const masterIndex =
+      buildMasterIndex();
+
+
+    const key =
+      makeFlightKey(
+        flight.date,
+        flight.flight,
+        flight.dep,
+        flight.arr
+      );
+
+
+    // Re-read Queue on the server; the client cannot choose the Master row.
+    if (payload.masterLogId && String(payload.masterLogId).trim() !== String(flight.masterLogId || '').trim()) {
+      throw new Error('Flight link changed. Refresh Today before saving.');
+    }
+    const existing = findMasterForQueue_(masterIndex, flight);
+    if (String(flight.masterLogId || '').trim() && !existing) {
+      throw new Error('Master Log ID is missing or duplicated in FLIGHT_LOG_MASTER. Save cancelled.');
+    }
+
+
+    let result;
+
+
+    if (
+      existing
+    ) {
+
+      result =
+        updateExistingMasterRow(
+          masterSheet,
+          existing,
+          flight,
+          payload
+        );
+
+    } else {
+
+      result =
+        createProvisionalRow(
+          masterSheet,
+          flight,
+          payload
+        );
+    }
+
+
+    updateQueueAfterSave(
+      flight.queueRow,
+      result.logId,
+      result.official
+    );
+
+
+    return result;
+
+  } finally {
+
+    lock.releaseLock();
+  }
+}
+
+
+/* =========================================================
+   UPDATE EXISTING MASTER ROW
+========================================================= */
+
+function updateExistingMasterRow(
+  sheet,
+  existing,
+  flight,
+  payload
+) {
+
+  const row =
+    existing.sheetRow;
+
+
+  const official =
+    String(
+      existing.recordStatus || ''
+    )
+      .toUpperCase()
+      .includes(
+        'OFFICIAL'
+      );
+
+
+  /*
+   * User-owned fields
+   */
+
+  sheet
+    .getRange(
+      row,
+      MASTER_COL.APP_TYPE
+    )
+    .setValue(
+      cleanText(
+        payload.approachType
+      )
+    );
+
+
+  sheet
+    .getRange(
+      row,
+      MASTER_COL.APP_NO
+    )
+    .setValue(
+      cleanText(
+        payload.approachNo
+      )
+    );
+
+
+  sheet
+    .getRange(
+      row,
+      MASTER_COL.PFPM_OVERRIDE
+    )
+    .setValue(
+      cleanText(
+        payload.pfpmOverride
+      )
+    );
+
+
+  sheet
+    .getRange(
+      row,
+      MASTER_COL.COMMENT
+    )
+    .setValue(
+      cleanText(
+        payload.comment
+      )
+    );
+
+
+  /*
+   * Mirrors
+   */
+
+  sheet
+    .getRange(
+      row,
+      MASTER_COL.PFPM_MIRROR
+    )
+    .setValue(
+      cleanText(
+        payload.pfpmOverride
+      )
+    );
+
+
+  sheet
+    .getRange(
+      row,
+      MASTER_COL.COMMENT_MIRROR
+    )
+    .setValue(
+      cleanText(
+        payload.comment
+      )
+    );
+
+
+  sheet
+    .getRange(
+      row,
+      MASTER_COL.APP_TYPE_MIRROR
+    )
+    .setValue(
+      cleanText(
+        payload.approachType
+      )
+    );
+
+
+  sheet
+    .getRange(
+      row,
+      MASTER_COL.APP_NO_MIRROR
+    )
+    .setValue(
+      cleanText(
+        payload.approachNo
+      )
+    );
+
+
+  /*
+   * T/O / L/D
+   *
+   * IMPORTANT:
+   * Official row = official values protected.
+   * Provisional row = only update when user explicitly selects Y/N.
+   * Blank = preserve existing value.
+   */
+
+  if (
+    !official
+  ) {
+
+    const takeoff =
+      normalizeYesNoBlank(
+        payload.takeoff
+      );
+
+
+    const landing =
+      normalizeYesNoBlank(
+        payload.landing
+      );
+
+
+    if (
+      takeoff !== ''
+    ) {
+
+      sheet
+        .getRange(
+          row,
+          MASTER_COL.TAKEOFF
+        )
+        .setValue(
+          takeoff
+        );
+    }
+
+
+    if (
+      landing !== ''
+    ) {
+
+      sheet
+        .getRange(
+          row,
+          MASTER_COL.LANDING
+        )
+        .setValue(
+          landing
+        );
+    }
+  }
+
+
+  /*
+   * Post-flight complete
+   */
+
+  sheet
+    .getRange(
+      row,
+      MASTER_COL.POSTFLIGHT_STATUS
+    )
+    .setValue(
+      'COMPLETE'
+    );
+
+
+  /*
+   * Never overwrite:
+   * - official times
+   * - source IDs
+   * - event ID
+   * - calendar provenance
+   * - official status
+   */
+
+
+  return {
+    action:
+      'UPDATED',
+
+    logId:
+      existing.logId,
+
+    official:
+      official
+  };
+}
+
+
+/* =========================================================
+   CREATE PROVISIONAL MASTER ROW
+========================================================= */
+
+function createProvisionalRow(
+  sheet,
+  flight,
+  payload
+) {
+
+  const row =
+    new Array(70)
+      .fill('');
+
+
+  const logId =
+    makeLogId(
+      flight.date,
+      flight.flight,
+      flight.dep,
+      flight.arr
+    );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.LOG_ID,
+    logId
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.DATE,
+    flight.date
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.APP_TYPE,
+    cleanText(
+      payload.approachType
+    )
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.APP_NO,
+    cleanText(
+      payload.approachNo
+    )
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.FLIGHT,
+    flight.flight
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.DEP,
+    flight.dep
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.ARR,
+    flight.arr
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.ROUTE,
+    flight.route
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.PFPM_OVERRIDE,
+    cleanText(
+      payload.pfpmOverride
+    )
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.COMMENT,
+    cleanText(
+      payload.comment
+    )
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.POSITION,
+    flight.role || 'FO'
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.PIC,
+    flight.pic || ''
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.BLOCK,
+    flight.block || ''
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.TAKEOFF,
+    normalizeYesNoBlank(
+      payload.takeoff
+    )
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.LANDING,
+    normalizeYesNoBlank(
+      payload.landing
+    )
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.SAFETY,
+    flight.safetyPilot
+      ? 'Y'
+      : 'N'
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.SAFETY_CREDIT,
+    '0:00'
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.DOM_INTL,
+    determineDomesticIntl(
+      flight.dep,
+      flight.arr
+    )
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.VERIFICATION,
+    'PENDING OFFICIAL'
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.SOURCE_ID,
+    'SRC-FLT-SCH-APP'
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.REMARKS,
+    'Post-flight user confirmed from Flight LOG App; official credit fields pending.'
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.OP_TYPE,
+    flight.safetyPilot
+      ? 'SAFETY PILOT'
+      : 'LINE'
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.CREW,
+    flight.crewType || ''
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.CREDIT_BASIS,
+    'No credited time until official Flight Log Report'
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.PFPM_MIRROR,
+    cleanText(
+      payload.pfpmOverride
+    )
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.PIC_STATUS,
+    flight.pic
+      ? 'ROSTER CONFIRMED'
+      : ''
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.CREW_SOURCE,
+    flight.source || ''
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.COMMENT_MIRROR,
+    cleanText(
+      payload.comment
+    )
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.APP_TYPE_MIRROR,
+    cleanText(
+      payload.approachType
+    )
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.APP_NO_MIRROR,
+    cleanText(
+      payload.approachNo
+    )
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.MONTH,
+    flight.date.slice(
+      0,
+      7
+    )
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.OPERATOR,
+    'Korean Air'
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.TYPE_RAW,
+    '3QP'
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.STANDARD_TYPE,
+    CONFIG.STANDARD_TYPE_32S
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.BT_SOURCE,
+    'FLT SCH Calendar'
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.RECORD_STATUS,
+    'FLOWN / PROVISIONAL'
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.INBOX_NOTE,
+    'Post-flight SAVE & DONE; official reconciliation pending'
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.POSTFLIGHT_STATUS,
+    'COMPLETE'
+  );
+
+
+  /*
+   * DATA PRIORITY:
+   * Calendar-derived values are provenance/reference only.
+   * Do NOT populate OUT_GMT / IN_GMT here.
+   * Actual/official times belong there only after post-flight/official reconciliation.
+   */
+
+  setArrayCol(
+    row,
+    MASTER_COL.CAL_OUT_KST,
+    flight.out || ''
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.CAL_IN_KST,
+    flight.in || ''
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.EVENT_ID,
+    flight.eventId || ''
+  );
+
+
+  setArrayCol(
+    row,
+    MASTER_COL.SYNC_NOTE,
+    'Created by Flight LOG App from SCHEDULE_QUEUE; official reconciliation pending.'
+  );
+
+
+  sheet.appendRow(
+    row
+  );
+
+
+  return {
+    action:
+      'CREATED',
+
+    logId:
+      logId,
+
+    official:
+      false
+  };
+}
+
+
+/* =========================================================
+   UPDATE QUEUE AFTER SAVE
+========================================================= */
+
+function updateQueueAfterSave(
+  queueRow,
+  logId,
+  official
+) {
+
+  const ss =
+    openFlightSpreadsheet_(
+      CONFIG.SPREADSHEET_ID
+    );
+
+  const sheet =
+    ss.getSheetByName(
+      CONFIG.QUEUE_SHEET
+    );
+
+
+  sheet
+    .getRange(
+      queueRow,
+      QUEUE_COL.STATUS
+    )
+    .setValue(
+      official
+        ? 'MASTER / OFFICIAL'
+        : 'FLOWN / PROVISIONAL'
+    );
+
+
+  sheet
+    .getRange(
+      queueRow,
+      QUEUE_COL.MASTER_LOG_ID
+    )
+    .setValue(
+      logId
+    );
+}
+
+
+/* =========================================================
+   HISTORY
+========================================================= */
+
+function getHistoryMonth(
+  year,
+  month
+) {
+
+  year =
+    Number(year);
+
+  month =
+    Number(month);
+
+
+  const ss =
+    openFlightSpreadsheet_(
+      CONFIG.SPREADSHEET_ID
+    );
+
+
+  const sheet =
+    ss.getSheetByName(
+      CONFIG.MASTER_SHEET
+    );
+
+
+  const lastRow =
+    sheet.getLastRow();
+
+
+  if (
+    lastRow < 2
+  ) {
+
+    return {
+      flights: []
+    };
+  }
+
+
+  /*
+   * Display values are used intentionally.
+   * This avoids Google Sheets duration cells
+   * being returned as Date objects.
+   */
+
+  const rows =
+    readMasterRows_(sheet, lastRow, 70, { month: `${year}-${String(month).padStart(2, '0')}` });
+
+
+  const targetMonth =
+    `${year}-${String(month).padStart(2, '0')}`;
+
+
+  const flights = [];
+
+
+  rows.forEach(
+    row => {
+
+      const date =
+        normalizeDateString(
+          row[
+            MASTER_COL.DATE - 1
+          ]
+        );
+
+
+      if (
+        !date ||
+        !date.startsWith(
+          targetMonth + '-'
+        )
+      ) {
+        return;
+      }
+
+
+      const recordStatus =
+        row[
+          MASTER_COL.RECORD_STATUS - 1
+        ] || '';
+
+
+      flights.push({
+
+        date:
+          date,
+
+        day:
+          Number(
+            date.slice(
+              8,
+              10
+            )
+          ),
+
+        flight:
+          row[
+            MASTER_COL.FLIGHT - 1
+          ],
+
+        dep:
+          row[
+            MASTER_COL.DEP - 1
+          ],
+
+        arr:
+          row[
+            MASTER_COL.ARR - 1
+          ],
+
+        block:
+          row[
+            MASTER_COL.BLOCK - 1
+          ],
+
+        pic:
+          row[
+            MASTER_COL.PIC - 1
+          ],
+
+        position:
+          row[
+            MASTER_COL.POSITION - 1
+          ],
+
+        safetyPilot:
+          normalizeYesNoBlank(
+            row[
+              MASTER_COL.SAFETY - 1
+            ]
+          ) === 'Y',
+
+        pfpm:
+          row[
+            MASTER_COL.PFPM - 1
+          ]
+          ||
+          row[
+            MASTER_COL.PFPM_OVERRIDE - 1
+          ],
+
+        approachType:
+          row[
+            MASTER_COL.APP_TYPE - 1
+          ],
+
+        approachNo:
+          row[
+            MASTER_COL.APP_NO - 1
+          ],
+
+        comment:
+          row[
+            MASTER_COL.COMMENT - 1
+          ],
+
+        takeoff:
+          normalizeYesNoBlank(
+            row[
+              MASTER_COL.TAKEOFF - 1
+            ]
+          ),
+
+        landing:
+          normalizeYesNoBlank(
+            row[
+              MASTER_COL.LANDING - 1
+            ]
+          ),
+
+        recordStatus:
+          recordStatus,
+
+        postFlightStatus:
+          row[
+            MASTER_COL.POSTFLIGHT_STATUS - 1
+          ],
+
+        official:
+          String(
+            recordStatus
+          )
+            .toUpperCase()
+            .includes(
+              'OFFICIAL'
+            ),
+
+        timeSort:
+          row[
+            MASTER_COL.CAL_OUT_KST - 1
+          ]
+          ||
+          row[
+            MASTER_COL.OUT_GMT - 1
+          ]
+          ||
+          ''
+      });
+
+    }
+  );
+
+
+  flights.sort(
+    (a, b) => {
+
+      if (
+        a.date !==
+        b.date
+      ) {
+        return a.date.localeCompare(
+          b.date
+        );
+      }
+
+      return String(
+        a.timeSort
+      )
+        .localeCompare(
+          String(
+            b.timeSort
+          )
+        );
+    }
+  );
+
+
+  return {
+    flights:
+      flights
+  };
+}
+
+
+/* =========================================================
+   RECENCY
+========================================================= */
+
+function getRecencyData() {
+
+  const ss =
+    openFlightSpreadsheet_(
+      CONFIG.SPREADSHEET_ID
+    );
+
+
+  const sheet =
+    ss.getSheetByName(
+      CONFIG.MASTER_SHEET
+    );
+
+
+  const lastRow =
+    sheet.getLastRow();
+
+
+  if (
+    lastRow < 2
+  ) {
+
+    return {
+      takeoff:
+        emptyRecencyResult(),
+
+      landing:
+        emptyRecencyResult()
+    };
+  }
+
+
+  const rows =
+    readMasterRows_(sheet, lastRow, 70, { recency: true });
+
+
+  const todayStr =
+    Utilities.formatDate(
+      new Date(),
+      CONFIG.TIMEZONE,
+      'yyyy-MM-dd'
+    );
+
+
+  const today =
+    dateStringToUtc(
+      todayStr
+    );
+
+
+  const windowStart =
+    addUtcDays(
+      today,
+      -(CONFIG.RECENCY_DAYS - 1)
+    );
+
+
+  const takeoffEvents = [];
+  const landingEvents = [];
+
+
+  rows.forEach(
+    row => {
+
+      const date =
+        normalizeDateString(
+          row[
+            MASTER_COL.DATE - 1
+          ]
+        );
+
+
+      if (
+        !date
+      ) {
+        return;
+      }
+
+
+      const eventDate =
+        dateStringToUtc(
+          date
+        );
+
+
+      if (
+        !eventDate ||
+        eventDate > today
+      ) {
+        return;
+      }
+
+
+      /*
+       * 32S only.
+       */
+
+      const standardType =
+        String(
+          row[
+            MASTER_COL.STANDARD_TYPE - 1
+          ] || ''
+        ).trim();
+
+
+      if (
+        standardType !==
+        CONFIG.STANDARD_TYPE_32S
+      ) {
+        return;
+      }
+
+
+      const flight =
+        normalizeFlightNo(
+          row[
+            MASTER_COL.FLIGHT - 1
+          ]
+        );
+
+
+      const dep =
+        String(
+          row[
+            MASTER_COL.DEP - 1
+          ] || ''
+        ).trim();
+
+
+      const arr =
+        String(
+          row[
+            MASTER_COL.ARR - 1
+          ] || ''
+        ).trim();
+
+
+      const recordStatus =
+        row[
+          MASTER_COL.RECORD_STATUS - 1
+        ] || '';
+
+
+      const official =
+        String(
+          recordStatus
+        )
+          .toUpperCase()
+          .includes(
+            'OFFICIAL'
+          );
+
+
+      const base = {
+
+        date:
+          date,
+
+        flight:
+          flight,
+
+        route:
+          dep + '→' + arr,
+
+        official:
+          official,
+
+        recordStatus:
+          recordStatus,
+
+        eventDate:
+          eventDate
+      };
+
+
+      if (
+        normalizeYesNoBlank(
+          row[
+            MASTER_COL.TAKEOFF - 1
+          ]
+        ) === 'Y'
+      ) {
+
+        takeoffEvents.push(
+          Object.assign(
+            {},
+            base
+          )
+        );
+      }
+
+
+      if (
+        normalizeYesNoBlank(
+          row[
+            MASTER_COL.LANDING - 1
+          ]
+        ) === 'Y'
+      ) {
+
+        landingEvents.push(
+          Object.assign(
+            {},
+            base
+          )
+        );
+      }
+
+    }
+  );
+
+
+  return {
+
+    asOf:
+      todayStr,
+
+    aircraft:
+      '32S',
+
+    rule:
+      '3 in 90',
+
+    takeoff:
+      calculateRecency(
+        takeoffEvents,
+        today,
+        windowStart
+      ),
+
+    landing:
+      calculateRecency(
+        landingEvents,
+        today,
+        windowStart
+      )
+  };
+}
+
+
+function calculateRecency(
+  events,
+  today,
+  windowStart
+) {
+
+  events.sort(
+    (a, b) =>
+      b.eventDate.getTime() -
+      a.eventDate.getTime()
+  );
+
+
+  const currentEvents =
+    events.filter(
+      e =>
+        e.eventDate >= windowStart &&
+        e.eventDate <= today
+    );
+
+
+  const current =
+    currentEvents.length >=
+    CONFIG.RECENCY_REQUIRED;
+
+
+  let expiry = '';
+
+
+  if (
+    current
+  ) {
+
+    /*
+     * Inclusive 90-day logic:
+     *
+     * qualifying event date = Day 1
+     * expiry = event date + 89 days
+     *
+     * Example:
+     * 23 Sep + 89 days = 21 Dec
+     */
+
+    const controllingEvent =
+      currentEvents[
+        CONFIG.RECENCY_REQUIRED - 1
+      ];
+
+
+    expiry =
+      utcDateToString(
+        addUtcDays(
+          controllingEvent.eventDate,
+          CONFIG.RECENCY_DAYS - 1
+        )
+      );
+  }
+
+
+  const recentThree =
+    currentEvents
+      .slice(
+        0,
+        CONFIG.RECENCY_REQUIRED
+      )
+      .map(
+        e => ({
+          date:
+            e.date,
+
+          flight:
+            e.flight,
+
+          route:
+            e.route,
+
+          official:
+            e.official,
+
+          source:
+            e.official
+              ? 'OFFICIAL'
+              : 'USER / PROVISIONAL'
+        })
+      );
+
+
+  const source =
+    recentThree.length ===
+    CONFIG.RECENCY_REQUIRED
+    &&
+    recentThree.every(
+      e => e.official
+    )
+      ? 'Official log'
+      : 'Master + User input';
+
+
+  return {
+
+    count:
+      currentEvents.length,
+
+    required:
+      CONFIG.RECENCY_REQUIRED,
+
+    days:
+      CONFIG.RECENCY_DAYS,
+
+    status:
+      current
+        ? 'CURRENT'
+        : 'NOT CURRENT',
+
+    expiry:
+      expiry,
+
+    source:
+      source,
+
+    recentThree:
+      recentThree
+  };
+}
+
+
+function emptyRecencyResult() {
+
+  return {
+    count: 0,
+    required: 3,
+    days: 90,
+    status: 'NOT CURRENT',
+    expiry: '',
+    source: 'Master',
+    recentThree: []
+  };
+}
+
+
+/* =========================================================
+   FLT SCH → SCHEDULE_QUEUE SYNC
+========================================================= */
+
+function syncScheduleQueueFromFltSchUncached_() {
+
+  const lock =
+    LockService.getScriptLock();
+
+
+  if (
+    !lock.tryLock(
+      30000
+    )
+  ) {
+    return;
+  }
+
+
+  try {
+
+    const ss =
+      openFlightSpreadsheet_(
+        CONFIG.SPREADSHEET_ID
+      );
+
+
+    const sheet =
+      ss.getSheetByName(
+        CONFIG.QUEUE_SHEET
+      );
+
+
+    const calendar =
+      CalendarApp.getCalendarById(
+        CONFIG.FLT_SCH_CALENDAR_ID
+      );
+
+
+    if (
+      !calendar
+    ) {
+      throw new Error(
+        'FLT SCH calendar not found.'
+      );
+    }
+
+
+    const now =
+      new Date();
+
+
+    const start =
+      new Date(
+        now.getTime() -
+        CONFIG.SYNC_PAST_DAYS *
+        24 *
+        60 *
+        60 *
+        1000
+      );
+
+
+    const end =
+      new Date(
+        now.getTime() +
+        CONFIG.SYNC_FUTURE_DAYS *
+        24 *
+        60 *
+        60 *
+        1000
+      );
+
+
+    const events =
+      calendar.getEvents(
+        start,
+        end
+      );
+
+
+    const lastRow =
+      sheet.getLastRow();
+
+
+    const existingRows =
+      lastRow >= 2
+
+        ? sheet
+            .getRange(
+              2,
+              1,
+              lastRow - 1,
+              14
+            )
+            .getDisplayValues()
+
+        : [];
+
+
+    const queueIndex = {};
+
+
+    existingRows.forEach(
+      (row, i) => {
+
+        const key =
+          makeFlightKey(
+            normalizeDateString(
+              row[
+                QUEUE_COL.DATE - 1
+              ]
+            ),
+
+            normalizeFlightNo(
+              row[
+                QUEUE_COL.FLIGHT - 1
+              ]
+            ),
+
+            row[
+              QUEUE_COL.DEP - 1
+            ],
+
+            row[
+              QUEUE_COL.ARR - 1
+            ]
+          );
+
+
+        if (
+          key
+        ) {
+
+          queueIndex[key] = {
+            sheetRow:
+              i + 2,
+
+            row:
+              row
+          };
+        }
+      }
+    );
+
+
+    const masterIndex =
+      buildMasterIndex();
+
+
+    let checked = 0;
+    let created = 0;
+    let updated = 0;
+    let unchanged = 0;
+
+
+    events.forEach(
+      event => {
+
+        const parsed =
+          parseFlightCalendarTitle(
+            event.getTitle()
+          );
+
+
+        if (
+          !parsed
+        ) {
+          return;
+        }
+
+
+        checked++;
+
+
+        const date =
+          Utilities.formatDate(
+            event.getStartTime(),
+            CONFIG.TIMEZONE,
+            'yyyy-MM-dd'
+          );
+
+
+        const latestOut =
+          Utilities.formatDate(
+            event.getStartTime(),
+            CONFIG.TIMEZONE,
+            'yyyy-MM-dd HH:mm'
+          );
+
+
+        const latestIn =
+          Utilities.formatDate(
+            event.getEndTime(),
+            CONFIG.TIMEZONE,
+            'yyyy-MM-dd HH:mm'
+          );
+
+
+        const key =
+          makeFlightKey(
+            date,
+            parsed.flight,
+            parsed.dep,
+            parsed.arr
+          );
+
+
+        const existing =
+          queueIndex[key];
+
+
+        const master =
+          masterIndex[key];
+
+
+        if (
+          existing
+        ) {
+
+          const sheetRow =
+            existing.sheetRow;
+
+
+          const current =
+            existing.row;
+
+
+          let changed =
+            false;
+
+
+          const existingQueueStatus =
+            String(
+              current[
+                QUEUE_COL.STATUS - 1
+              ] || ''
+            )
+              .trim()
+              .toUpperCase();
+
+
+          const protectQueueTimes =
+            isQueueTimeProtectedStatus_(
+              existingQueueStatus
+            );
+
+
+          /*
+           * NEVER overwrite Queue Event ID
+           * for an existing row.
+           *
+           * DATA PRIORITY GUARD:
+           * After a flight becomes operationally closed/post-flight,
+           * FLT SCH schedule refresh must not replace actual/official
+           * Queue LATEST OUT/IN with a lower-priority schedule value.
+           */
+
+          if (
+            !protectQueueTimes &&
+            current[
+              QUEUE_COL.LATEST_OUT - 1
+            ] !== latestOut
+          ) {
+
+            sheet
+              .getRange(
+                sheetRow,
+                QUEUE_COL.LATEST_OUT
+              )
+              .setValue(
+                latestOut
+              );
+
+            changed =
+              true;
+          }
+
+
+          if (
+            !protectQueueTimes &&
+            current[
+              QUEUE_COL.LATEST_IN - 1
+            ] !== latestIn
+          ) {
+
+            sheet
+              .getRange(
+                sheetRow,
+                QUEUE_COL.LATEST_IN
+              )
+              .setValue(
+                latestIn
+              );
+
+            changed =
+              true;
+          }
+
+          /*
+           * Fill Queue → Master link when possible.
+           */
+
+          if (
+            master &&
+            !current[
+              QUEUE_COL.MASTER_LOG_ID - 1
+            ]
+          ) {
+
+            sheet
+              .getRange(
+                sheetRow,
+                QUEUE_COL.MASTER_LOG_ID
+              )
+              .setValue(
+                master.logId
+              );
+
+            changed =
+              true;
+          }
+
+
+          /*
+           * If Master is officially confirmed,
+           * Queue may safely reflect that status.
+           */
+
+          if (
+            master &&
+            String(
+              master.recordStatus
+            )
+              .toUpperCase()
+              .includes(
+                'OFFICIAL'
+              )
+          ) {
+
+            const queueStatus =
+              String(
+                current[
+                  QUEUE_COL.STATUS - 1
+                ] || ''
+              ).toUpperCase();
+
+
+            if (
+              !queueStatus.includes(
+                'CANCELLED'
+              )
+              &&
+              !queueStatus.includes(
+                'DEADHEAD'
+              )
+              &&
+              !queueStatus.includes(
+                'TRAVEL'
+              )
+              &&
+              queueStatus !==
+              'MASTER / OFFICIAL'
+            ) {
+
+              sheet
+                .getRange(
+                  sheetRow,
+                  QUEUE_COL.STATUS
+                )
+                .setValue(
+                  'MASTER / OFFICIAL'
+                );
+
+              changed =
+                true;
+            }
+          }
+
+
+          if (
+            !current[
+              QUEUE_COL.MEMO - 1
+            ]
+          ) {
+
+            sheet
+              .getRange(
+                sheetRow,
+                QUEUE_COL.MEMO
+              )
+              .setValue(
+                'FLT SCH sync'
+              );
+
+            changed =
+              true;
+          }
+
+
+          if (
+            !current[
+              QUEUE_COL.SOURCE - 1
+            ]
+          ) {
+
+            sheet
+              .getRange(
+                sheetRow,
+                QUEUE_COL.SOURCE
+              )
+              .setValue(
+                'FLT SCH'
+              );
+
+            changed =
+              true;
+          }
+
+
+          if (
+            changed
+          ) {
+            updated++;
+          } else {
+            unchanged++;
+          }
+
+
+        } else {
+
+          const newRow =
+            new Array(14)
+              .fill('');
+
+
+          setArrayCol(
+            newRow,
+            QUEUE_COL.EVENT_ID,
+            event.getId()
+          );
+
+
+          setArrayCol(
+            newRow,
+            QUEUE_COL.DATE,
+            date
+          );
+
+
+          setArrayCol(
+            newRow,
+            QUEUE_COL.FLIGHT,
+            parsed.flight
+          );
+
+
+          setArrayCol(
+            newRow,
+            QUEUE_COL.DEP,
+            parsed.dep
+          );
+
+
+          setArrayCol(
+            newRow,
+            QUEUE_COL.ARR,
+            parsed.arr
+          );
+
+
+          setArrayCol(
+            newRow,
+            QUEUE_COL.ROUTE,
+            parsed.dep +
+            '-' +
+            parsed.arr
+          );
+
+
+          setArrayCol(
+            newRow,
+            QUEUE_COL.ORIGINAL_OUT,
+            latestOut
+          );
+
+
+          setArrayCol(
+            newRow,
+            QUEUE_COL.ORIGINAL_IN,
+            latestIn
+          );
+
+
+          setArrayCol(
+            newRow,
+            QUEUE_COL.LATEST_OUT,
+            latestOut
+          );
+
+
+          setArrayCol(
+            newRow,
+            QUEUE_COL.LATEST_IN,
+            latestIn
+          );
+
+
+          setArrayCol(
+            newRow,
+            QUEUE_COL.STATUS,
+            'SCHEDULED'
+          );
+
+
+          setArrayCol(
+            newRow,
+            QUEUE_COL.MEMO,
+            'FLT SCH sync'
+          );
+
+
+          if (
+            master
+          ) {
+
+            setArrayCol(
+              newRow,
+              QUEUE_COL.MASTER_LOG_ID,
+              master.logId
+            );
+
+
+            if (
+              String(
+                master.recordStatus
+              )
+                .toUpperCase()
+                .includes(
+                  'OFFICIAL'
+                )
+            ) {
+
+              setArrayCol(
+                newRow,
+                QUEUE_COL.STATUS,
+                'MASTER / OFFICIAL'
+              );
+            }
+          }
+
+
+          setArrayCol(
+            newRow,
+            QUEUE_COL.SOURCE,
+            'FLT SCH'
+          );
+
+
+          sheet.appendRow(
+            newRow
+          );
+
+
+          created++;
+        }
+      }
+    );
+
+
+    return {
+      checked:
+        checked,
+
+      created:
+        created,
+
+      updated:
+        updated,
+
+      unchanged:
+        unchanged
+    };
+
+
+  } finally {
+
+    lock.releaseLock();
+  }
+}
+
+
+/* =========================================================
+   TRIGGER
+========================================================= */
+
+function installFltSchSyncTrigger() {
+
+  const functionName =
+    'syncScheduleQueueFromFltSch';
+
+
+  ScriptApp
+    .getProjectTriggers()
+    .forEach(
+      trigger => {
+
+        if (
+          trigger.getHandlerFunction() ===
+          functionName
+        ) {
+
+          ScriptApp.deleteTrigger(
+            trigger
+          );
+        }
+      }
+    );
+
+
+  ScriptApp
+    .newTrigger(
+      functionName
+    )
+    .timeBased()
+    .everyMinutes(
+      5
+    )
+    .create();
+
+
+  Logger.log(
+    'FLT SCH → SCHEDULE_QUEUE automatic sync installed: every 5 minutes.'
+  );
+}
+
+
+/* =========================================================
+   CREW PARSER
+========================================================= */
+
+function parseCrewMemo(
+  memo
+) {
+
+  memo =
+    String(
+      memo || ''
+    );
+
+
+  const picMatch =
+    memo.match(
+      /PIC\s+([^;]+)/i
+    );
+
+
+  const fdtMatch =
+    memo.match(
+      /FDT\s+([^;]+)/i
+    );
+
+
+  const pic =
+    picMatch
+      ? picMatch[1].trim()
+      : '';
+
+
+  const fdt =
+    fdtMatch
+      ? fdtMatch[1].trim()
+      : '';
+
+
+  const safetyPilot =
+    /Safety\s*Pilot\s*Y/i
+      .test(
+        memo
+      )
+    ||
+    (
+      !!fdt &&
+      /USER\s*=\s*FO/i
+        .test(
+          memo
+        )
+    );
+
+
+  const fourCrew =
+    /4[\s-]*crew/i
+      .test(
+        memo
+      );
+
+
+  let crewType =
+    'CAP + FO (USER)';
+
+
+  if (
+    fourCrew
+  ) {
+
+    crewType =
+      '4-CREW (USER FO)';
+
+  } else if (
+    fdt &&
+    safetyPilot
+  ) {
+
+    crewType =
+      'CAP + FO + FDT (USER / SAFETY)';
+  }
+
+
+  return {
+    pic:
+      pic,
+
+    fdt:
+      fdt,
+
+    role:
+      'FO',
+
+    safetyPilot:
+      safetyPilot,
+
+    crewType:
+      crewType
+  };
+}
+
+
+/* =========================================================
+   HELPERS
+========================================================= */
+
+function cleanFlightForClient(
+  flight
+) {
+
+  const copy =
+    Object.assign(
+      {},
+      flight
+    );
+
+
+  delete copy.outDate;
+  delete copy.inDate;
+  delete copy.queueRow;
+
+
+  return copy;
+}
+
+
+function makeFlightKey(
+  date,
+  flight,
+  dep,
+  arr
+) {
+
+  date =
+    normalizeDateString(
+      date
+    );
+
+
+  flight =
+    normalizeFlightNo(
+      flight
+    );
+
+
+  dep =
+    String(
+      dep || ''
+    ).trim().toUpperCase();
+
+
+  arr =
+    String(
+      arr || ''
+    ).trim().toUpperCase();
+
+
+  if (
+    !date ||
+    !flight ||
+    !dep ||
+    !arr
+  ) {
+    return '';
+  }
+
+
+  return [
+    date,
+    flight,
+    dep,
+    arr
+  ].join('|');
+}
+
+
+function makeLogId(
+  date,
+  flight,
+  dep,
+  arr
+) {
+
+  return [
+    'KAL',
+    date.replace(
+      /-/g,
+      ''
+    ),
+    normalizeFlightNo(
+      flight
+    ),
+    String(
+      dep
+    ).toUpperCase(),
+    String(
+      arr
+    ).toUpperCase()
+  ].join('-');
+}
+
+
+function normalizeFlightNo(
+  value
+) {
+
+  const text =
+    String(
+      value || ''
+    )
+      .trim()
+      .toUpperCase()
+      .replace(
+        /\s+/g,
+        ''
+      );
+
+
+  const match =
+    text.match(
+      /^KE0*(\d+)$/
+    );
+
+
+  if (
+    match
+  ) {
+
+    return (
+      'KE' +
+      String(
+        Number(
+          match[1]
+        )
+      )
+    );
+  }
+
+
+  return text;
+}
+
+
+function normalizeDateString(
+  value
+) {
+
+  const text =
+    String(
+      value || ''
+    ).trim();
+
+
+  const match =
+    text.match(
+      /^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})/
+    );
+
+
+  if (
+    !match
+  ) {
+    return '';
+  }
+
+
+  return (
+    match[1] +
+    '-' +
+    String(
+      match[2]
+    ).padStart(
+      2,
+      '0'
+    )
+    +
+    '-' +
+    String(
+      match[3]
+    ).padStart(
+      2,
+      '0'
+    )
+  );
+}
+
+
+function normalizeYesNoBlank(
+  value
+) {
+
+  const text =
+    String(
+      value == null
+        ? ''
+        : value
+    )
+      .trim()
+      .toUpperCase();
+
+
+  if (
+    text === 'Y' ||
+    text === 'YES'
+  ) {
+    return 'Y';
+  }
+
+
+  if (
+    text === 'N' ||
+    text === 'NO'
+  ) {
+    return 'N';
+  }
+
+
+  return '';
+}
+
+
+/* =========================================================
+   DATA PRIORITY / QUEUE PROTECTION
+========================================================= */
+
+/**
+ * Lower-priority FLT SCH schedule data may update Queue times only while
+ * the row is still schedule-controlled.
+ *
+ * Protected statuses:
+ * - FLOWN / PROVISIONAL
+ * - MASTER / OFFICIAL
+ * - DEADHEAD / TRAVEL
+ * - CANCELLED
+ */
+function isQueueTimeProtectedStatus_(
+  status
+) {
+
+  const text =
+    String(
+      status || ''
+    )
+      .trim()
+      .toUpperCase();
+
+
+  return (
+    text.includes(
+      'FLOWN'
+    )
+    ||
+    text.includes(
+      'PROVISIONAL'
+    )
+    ||
+    text.includes(
+      'MASTER / OFFICIAL'
+    )
+    ||
+    text.includes(
+      'OFFICIAL'
+    )
+    ||
+    text.includes(
+      'DEADHEAD'
+    )
+    ||
+    text.includes(
+      'TRAVEL'
+    )
+    ||
+    text.includes(
+      'CANCELLED'
+    )
+  );
+}
+
+
+function parseKstDateTime(
+  value
+) {
+
+  const text =
+    String(
+      value || ''
+    ).trim();
+
+
+  const match =
+    text.match(
+      /^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2})/
+    );
+
+
+  if (
+    !match
+  ) {
+    return null;
+  }
+
+
+  return new Date(
+    `${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:00+09:00`
+  );
+}
+
+
+function timeFromDateTimeString(
+  value
+) {
+
+  const text =
+    String(
+      value || ''
+    );
+
+
+  const match =
+    text.match(
+      /(\d{2}):(\d{2})/
+    );
+
+
+  return match
+    ? (
+        match[1] +
+        ':' +
+        match[2]
+      )
+    : '';
+}
+
+
+function calcBlockTime(
+  outDate,
+  inDate
+) {
+
+  if (
+    !outDate ||
+    !inDate
+  ) {
+    return '';
+  }
+
+
+  const minutes =
+    Math.round(
+      (
+        inDate.getTime() -
+        outDate.getTime()
+      )
+      /
+      60000
+    );
+
+
+  if (
+    minutes < 0
+  ) {
+    return '';
+  }
+
+
+  const hours =
+    Math.floor(
+      minutes / 60
+    );
+
+
+  const mins =
+    minutes % 60;
+
+
+  return (
+    hours +
+    ':' +
+    String(
+      mins
+    ).padStart(
+      2,
+      '0'
+    )
+  );
+}
+
+
+function parseFlightCalendarTitle(
+  title
+) {
+
+  const text =
+    String(
+      title || ''
+    );
+
+
+  const match =
+    text.match(
+      /Flight\s*:\s*KE\s*0*(\d+)\s+([A-Z]{3})\s*-\s*([A-Z]{3})/i
+    );
+
+
+  if (
+    !match
+  ) {
+    return null;
+  }
+
+
+  return {
+    flight:
+      'KE' +
+      String(
+        Number(
+          match[1]
+        )
+      ),
+
+    dep:
+      match[2]
+        .toUpperCase(),
+
+    arr:
+      match[3]
+        .toUpperCase()
+  };
+}
+
+
+function determineDomesticIntl(
+  dep,
+  arr
+) {
+
+  const koreanAirports = [
+    'ICN',
+    'GMP',
+    'PUS',
+    'CJU',
+    'TAE',
+    'KWJ',
+    'RSU',
+    'USN',
+    'KPO',
+    'CJJ',
+    'KUV',
+    'YNY',
+    'WJU'
+  ];
+
+
+  return (
+    koreanAirports.includes(
+      String(dep).toUpperCase()
+    )
+    &&
+    koreanAirports.includes(
+      String(arr).toUpperCase()
+    )
+  )
+    ? 'DOMESTIC'
+    : 'INTERNATIONAL';
+}
+
+
+function setArrayCol(
+  row,
+  col,
+  value
+) {
+
+  row[
+    col - 1
+  ] = value;
+}
+
+
+function cleanText(
+  value
+) {
+
+  return String(
+    value == null
+      ? ''
+      : value
+  ).trim();
+}
+
+
+/* =========================================================
+   UTC DATE HELPERS FOR RECENCY
+========================================================= */
+
+function dateStringToUtc(
+  value
+) {
+
+  const date =
+    normalizeDateString(
+      value
+    );
+
+
+  if (
+    !date
+  ) {
+    return null;
+  }
+
+
+  const parts =
+    date
+      .split('-')
+      .map(Number);
+
+
+  return new Date(
+    Date.UTC(
+      parts[0],
+      parts[1] - 1,
+      parts[2]
+    )
+  );
+}
+
+
+function addUtcDays(
+  date,
+  days
+) {
+
+  return new Date(
+    date.getTime() +
+    days *
+    24 *
+    60 *
+    60 *
+    1000
+  );
+}
+
+
+function utcDateToString(
+  date
+) {
+
+  return (
+    date.getUTCFullYear()
+    +
+    '-'
+    +
+    String(
+      date.getUTCMonth() + 1
+    ).padStart(
+      2,
+      '0'
+    )
+    +
+    '-'
+    +
+    String(
+      date.getUTCDate()
+    ).padStart(
+      2,
+      '0'
+    )
+  );
+}
+
+/* =========================================================
+   OFFICIAL RECONCILIATION
+========================================================= */
+
+/**
+ * Official Flight Log 데이터가 들어왔을 때
+ * 기존 provisional / user input과 대조하여 Master를 확정한다.
+ *
+ * official = {
+ *   date: '2026-10-02',
+ *   flight: 'KE1406',
+ *   dep: 'PUS',
+ *   arr: 'ICN',
+ *
+ *   registration: 'HLxxxx',
+ *   dutyCode: 'F',
+ *   position: 'FO',
+ *   pic: 'NAME',
+ *
+ *   outGmt: '23:41',
+ *   inGmt: '00:39',
+ *   block: '0:58',
+ *
+ *   companyTime: '0:58',
+ *   molitTime: '0:58',
+ *   day: '0:58',
+ *   night: '0:00',
+ *   inst: '0:40',
+ *   ifr: '0:40',
+ *
+ *   takeoff: 'Y',
+ *   landing: 'Y',
+ *   autoland: 'N',
+ *
+ *   sic: '0:58',
+ *   safetyCredit: '0:00',
+ *
+ *   sourceId: 'SRC-KAL-FLIGHTLOG-YYYYMMDD'
+ * }
+ */
+function reconcileOfficialFlightRecordUncached_(official) {
+
+  if (!official) {
+    throw new Error(
+      'Official record is missing.'
+    );
+  }
+
+
+  const date =
+    normalizeDateString(
+      official.date
+    );
+
+  const flight =
+    normalizeFlightNo(
+      official.flight
+    );
+
+  const dep =
+    String(
+      official.dep || ''
+    )
+      .trim()
+      .toUpperCase();
+
+  const arr =
+    String(
+      official.arr || ''
+    )
+      .trim()
+      .toUpperCase();
+
+
+  if (
+    !date ||
+    !flight ||
+    !dep ||
+    !arr
+  ) {
+
+    throw new Error(
+      'Official record key is incomplete.'
+    );
+  }
+
+
+  const lock =
+    LockService.getScriptLock();
+
+
+  lock.waitLock(
+    30000
+  );
+
+
+  try {
+
+    const ss =
+      openFlightSpreadsheet_(
+        CONFIG.SPREADSHEET_ID
+      );
+
+
+    const sheet =
+      ss.getSheetByName(
+        CONFIG.MASTER_SHEET
+      );
+
+
+    const masterIndex =
+      buildMasterIndex();
+
+
+    const key =
+      makeFlightKey(
+        date,
+        flight,
+        dep,
+        arr
+      );
+
+
+    const existing =
+      findExistingMasterByIdentity(
+        masterIndex,
+        {
+          date: date,
+          flight: flight,
+          dep: dep,
+          arr: arr,
+          eventId:
+            official.eventId || ''
+        }
+      ) ||
+      masterIndex[key];
+
+
+    if (!existing) {
+
+      throw new Error(
+        'Matching Master row not found: ' +
+        key
+      );
+    }
+
+
+    const row =
+      existing.sheetRow;
+
+
+    /*
+     * Read current row BEFORE overwrite.
+     * Used for discrepancy audit.
+     */
+
+    const current =
+      sheet
+        .getRange(
+          row,
+          1,
+          1,
+          70
+        )
+        .getDisplayValues()[0];
+
+
+    const userTakeoff =
+      normalizeYesNoBlank(
+        current[
+          MASTER_COL.TAKEOFF - 1
+        ]
+      );
+
+
+    const userLanding =
+      normalizeYesNoBlank(
+        current[
+          MASTER_COL.LANDING - 1
+        ]
+      );
+
+
+    const officialTakeoff =
+      normalizeYesNoBlank(
+        official.takeoff
+      );
+
+
+    const officialLanding =
+      normalizeYesNoBlank(
+        official.landing
+      );
+
+
+    const discrepancies = [];
+
+
+    /*
+     * T/O comparison
+     */
+
+    if (
+      userTakeoff &&
+      officialTakeoff &&
+      userTakeoff !== officialTakeoff
+    ) {
+
+      discrepancies.push(
+        `T/O USER ${userTakeoff} → OFFICIAL ${officialTakeoff}`
+      );
+    }
+
+
+    /*
+     * L/D comparison
+     */
+
+    if (
+      userLanding &&
+      officialLanding &&
+      userLanding !== officialLanding
+    ) {
+
+      discrepancies.push(
+        `L/D USER ${userLanding} → OFFICIAL ${officialLanding}`
+      );
+    }
+
+
+    /*
+     * Official source wins.
+     */
+
+    setCellIfProvided(
+      sheet,
+      row,
+      MASTER_COL.REG,
+      official.registration
+    );
+
+
+    setCellIfProvided(
+      sheet,
+      row,
+      MASTER_COL.DUTY,
+      official.dutyCode
+    );
+
+
+    setCellIfProvided(
+      sheet,
+      row,
+      MASTER_COL.POSITION,
+      official.position
+    );
+
+
+    setCellIfProvided(
+      sheet,
+      row,
+      MASTER_COL.PIC,
+      official.pic
+    );
+
+
+    setCellIfProvided(
+      sheet,
+      row,
+      MASTER_COL.OUT_GMT,
+      official.outGmt
+    );
+
+
+    setCellIfProvided(
+      sheet,
+      row,
+      MASTER_COL.IN_GMT,
+      official.inGmt
+    );
+
+
+    setCellIfProvided(
+      sheet,
+      row,
+      MASTER_COL.BLOCK,
+      official.block
+    );
+
+
+    setCellIfProvided(
+      sheet,
+      row,
+      MASTER_COL.COMPANY,
+      official.companyTime
+    );
+
+
+    setCellIfProvided(
+      sheet,
+      row,
+      MASTER_COL.MOLIT,
+      official.molitTime
+    );
+
+
+    setCellIfProvided(
+      sheet,
+      row,
+      MASTER_COL.DAY,
+      official.day
+    );
+
+
+    setCellIfProvided(
+      sheet,
+      row,
+      MASTER_COL.NIGHT,
+      official.night
+    );
+
+
+    setCellIfProvided(
+      sheet,
+      row,
+      MASTER_COL.INST,
+      official.inst
+    );
+
+
+    setCellIfProvided(
+      sheet,
+      row,
+      MASTER_COL.IFR,
+      official.ifr
+    );
+
+
+    /*
+     * T/O / L/D
+     * Official always wins.
+     */
+
+    if (
+      officialTakeoff !== ''
+    ) {
+
+      sheet
+        .getRange(
+          row,
+          MASTER_COL.TAKEOFF
+        )
+        .setValue(
+          officialTakeoff
+        );
+    }
+
+
+    if (
+      officialLanding !== ''
+    ) {
+
+      sheet
+        .getRange(
+          row,
+          MASTER_COL.LANDING
+        )
+        .setValue(
+          officialLanding
+        );
+    }
+
+
+    setCellIfProvided(
+      sheet,
+      row,
+      MASTER_COL.AUTOLAND,
+      normalizeYesNoBlank(
+        official.autoland
+      )
+    );
+
+
+    setCellIfProvided(
+      sheet,
+      row,
+      MASTER_COL.SIC,
+      official.sic
+    );
+
+
+    setCellIfProvided(
+      sheet,
+      row,
+      MASTER_COL.SAFETY_CREDIT,
+      official.safetyCredit
+    );
+
+
+    /*
+     * Verification / provenance
+     */
+
+    sheet
+      .getRange(
+        row,
+        MASTER_COL.VERIFICATION
+      )
+      .setValue(
+        'SOURCE IMPORTED'
+      );
+
+
+    if (
+      official.sourceId
+    ) {
+
+      sheet
+        .getRange(
+          row,
+          MASTER_COL.SOURCE_ID
+        )
+        .setValue(
+          official.sourceId
+        );
+    }
+
+
+    sheet
+      .getRange(
+        row,
+        MASTER_COL.BT_SOURCE
+      )
+      .setValue(
+        'Flight Log Report'
+      );
+
+
+    sheet
+      .getRange(
+        row,
+        MASTER_COL.RECORD_STATUS
+      )
+      .setValue(
+        'OFFICIAL CONFIRMED'
+      );
+
+
+    /*
+     * Preserve user-entered:
+     * - Approach
+     * - PF/PM Override
+     * - Comment
+     *
+     * Post-flight COMPLETE also preserved.
+     */
+
+
+    const oldRemarks =
+      String(
+        current[
+          MASTER_COL.REMARKS - 1
+        ] || ''
+      ).trim();
+
+
+    let reconciliationNote =
+      'Official Flight Log reconciled; user-entered post-flight fields preserved.';
+
+
+    if (
+      discrepancies.length
+    ) {
+
+      reconciliationNote +=
+        ' DISCREPANCY: ' +
+        discrepancies.join('; ');
+    }
+
+
+    const newRemarks =
+      oldRemarks
+
+        ? oldRemarks +
+          ' | ' +
+          reconciliationNote
+
+        : reconciliationNote;
+
+
+    sheet
+      .getRange(
+        row,
+        MASTER_COL.REMARKS
+      )
+      .setValue(
+        newRemarks
+      );
+
+
+    const oldSyncNote =
+      String(
+        current[
+          MASTER_COL.SYNC_NOTE - 1
+        ] || ''
+      ).trim();
+
+
+    const syncNote =
+      discrepancies.length
+
+        ? (
+            'OFFICIAL reconciliation completed. ' +
+            discrepancies.join('; ')
+          )
+
+        : 'OFFICIAL reconciliation completed; provisional T/O/L/D matched or no prior user value.';
+
+
+    sheet
+      .getRange(
+        row,
+        MASTER_COL.SYNC_NOTE
+      )
+      .setValue(
+        oldSyncNote
+
+          ? oldSyncNote +
+            ' | ' +
+            syncNote
+
+          : syncNote
+      );
+
+
+    /*
+     * Queue state update
+     */
+
+    markQueueOfficial(
+      date,
+      flight,
+      dep,
+      arr,
+      existing.logId
+    );
+
+
+    return {
+
+      logId:
+        existing.logId,
+
+      status:
+        'OFFICIAL CONFIRMED',
+
+      discrepancies:
+        discrepancies,
+
+      takeoff:
+        officialTakeoff,
+
+      landing:
+        officialLanding
+    };
+
+
+  } finally {
+
+    lock.releaseLock();
+  }
+}
+
+
+/* =========================================================
+   OFFICIAL RECONCILIATION HELPERS
+========================================================= */
+
+function setCellIfProvided(
+  sheet,
+  row,
+  col,
+  value
+) {
+
+  if (
+    value === undefined ||
+    value === null ||
+    value === ''
+  ) {
+    return;
+  }
+
+
+  sheet
+    .getRange(
+      row,
+      col
+    )
+    .setValue(
+      value
+    );
+}
+
+
+function markQueueOfficial(
+  date,
+  flight,
+  dep,
+  arr,
+  logId
+) {
+
+  const ss =
+    openFlightSpreadsheet_(
+      CONFIG.SPREADSHEET_ID
+    );
+
+
+  const sheet =
+    ss.getSheetByName(
+      CONFIG.QUEUE_SHEET
+    );
+
+
+  const lastRow =
+    sheet.getLastRow();
+
+
+  if (
+    lastRow < 2
+  ) {
+    return;
+  }
+
+
+  const rows =
+    sheet
+      .getRange(
+        2,
+        1,
+        lastRow - 1,
+        14
+      )
+      .getDisplayValues();
+
+
+  const targetKey =
+    makeFlightKey(
+      date,
+      flight,
+      dep,
+      arr
+    );
+
+
+  for (
+    let i = 0;
+    i < rows.length;
+    i++
+  ) {
+
+    const row =
+      rows[i];
+
+
+    const key =
+      makeFlightKey(
+        row[
+          QUEUE_COL.DATE - 1
+        ],
+
+        row[
+          QUEUE_COL.FLIGHT - 1
+        ],
+
+        row[
+          QUEUE_COL.DEP - 1
+        ],
+
+        row[
+          QUEUE_COL.ARR - 1
+        ]
+      );
+
+
+    if (
+      key !== targetKey
+    ) {
+      continue;
+    }
+
+
+    const sheetRow =
+      i + 2;
+
+
+    sheet
+      .getRange(
+        sheetRow,
+        QUEUE_COL.STATUS
+      )
+      .setValue(
+        'MASTER / OFFICIAL'
+      );
+
+
+    sheet
+      .getRange(
+        sheetRow,
+        QUEUE_COL.MASTER_LOG_ID
+      )
+      .setValue(
+        logId
+      );
+
+
+    return;
+  }
+}
+
+
+/* =========================================================
+   DRY RUN — OFFICIAL COMPARISON ONLY
+========================================================= */
+
+function previewOfficialReconciliation(
+  official
+) {
+
+  const masterIndex =
+    buildMasterIndex();
+
+
+  const key =
+    makeFlightKey(
+      official.date,
+      official.flight,
+      official.dep,
+      official.arr
+    );
+
+
+  const existing =
+    masterIndex[key];
+
+
+  if (
+    !existing
+  ) {
+
+    return {
+      found: false,
+      key: key
+    };
+  }
+
+
+  const ss =
+    openFlightSpreadsheet_(
+      CONFIG.SPREADSHEET_ID
+    );
+
+
+  const sheet =
+    ss.getSheetByName(
+      CONFIG.MASTER_SHEET
+    );
+
+
+  const row =
+    sheet
+      .getRange(
+        existing.sheetRow,
+        1,
+        1,
+        70
+      )
+      .getDisplayValues()[0];
+
+
+  const currentTakeoff =
+    normalizeYesNoBlank(
+      row[
+        MASTER_COL.TAKEOFF - 1
+      ]
+    );
+
+
+  const currentLanding =
+    normalizeYesNoBlank(
+      row[
+        MASTER_COL.LANDING - 1
+      ]
+    );
+
+
+  const officialTakeoff =
+    normalizeYesNoBlank(
+      official.takeoff
+    );
+
+
+  const officialLanding =
+    normalizeYesNoBlank(
+      official.landing
+    );
+
+
+  return {
+
+    found: true,
+
+    logId:
+      existing.logId,
+
+    current: {
+      takeoff:
+        currentTakeoff,
+
+      landing:
+        currentLanding
+    },
+
+    official: {
+      takeoff:
+        officialTakeoff,
+
+      landing:
+        officialLanding
+    },
+
+    discrepancy: {
+      takeoff:
+        !!(
+          currentTakeoff &&
+          officialTakeoff &&
+          currentTakeoff !==
+          officialTakeoff
+        ),
+
+      landing:
+        !!(
+          currentLanding &&
+          officialLanding &&
+          currentLanding !==
+          officialLanding
+        )
+    }
+  };
+}
+
+function doPost(e) {
+  try {
+    const body = JSON.parse(
+      e.postData.contents || '{}'
+    );
+
+    const apiKey = body.apiKey || '';
+
+    const expectedKey =
+      PropertiesService
+        .getScriptProperties()
+        .getProperty('FLIGHT_LOG_API_KEY');
+
+    if (!expectedKey || apiKey !== expectedKey) {
+      return jsonResponse_({
+        ok: false,
+        error: 'Unauthorized'
+      });
+    }
+
+    const action = body.action;
+    const payload = body.payload || {};
+
+
+    // =====================================================
+    // TODAY
+    // =====================================================
+
+    if (action === 'getAppData') {
+      return jsonResponse_({
+        ok: true,
+        data: cachedFlightRead_('getAppData', payload, getAppData)
+      });
+    }
+
+
+    if (action === 'savePostFlight') {
+      return jsonResponse_({
+        ok: true,
+        data: savePostFlight(payload)
+      });
+    }
+
+
+    // =====================================================
+    // HISTORY
+    // =====================================================
+
+    if (action === 'getHistoryMonth') {
+      const year = Number(payload.year);
+      const month = Number(payload.month);
+
+      if (
+        !year ||
+        !month ||
+        month < 1 ||
+        month > 12
+      ) {
+        throw new Error(
+          'Invalid history year/month.'
+        );
+      }
+
+      return jsonResponse_({
+        ok: true,
+        data: cachedFlightRead_('getHistoryMonth', payload, function() { return getHistoryMonth(year, month); })
+      });
+    }
+
+
+    // =====================================================
+    // RECENCY
+    // =====================================================
+
+    if (action === 'getRecencyData') {
+      return jsonResponse_({
+        ok: true,
+        data: cachedFlightRead_('getRecencyData', payload, getRecencyData)
+      });
+    }
+
+    if (action === 'getCaptainCard') {
+      return jsonResponse_({ ok: true, data: cachedFlightRead_('getCaptainCard', payload, function() { return getCaptainCard(payload); }) });
+    }
+
+    if (action === 'getCaptains') {
+      return jsonResponse_({ ok: true, data: cachedFlightRead_('getCaptains', payload, getCaptains) });
+    }
+
+   if (action === 'getCaptainProfile') {
+      return jsonResponse_({
+        ok: true,
+        data: cachedFlightRead_('getCaptainProfile', payload, function() { return getCaptainProfile(payload); })
+      });
+    }
+
+  if (action === 'saveCaptainProfile') {
+    return jsonResponse_({
+      ok: true,
+      data: saveCaptainProfile(payload)
+      });
+    }
+
+
+    throw new Error(
+      'Unknown action: ' + action
+    );
+
+  } catch (err) {
+
+    return jsonResponse_({
+      ok: false,
+
+      error:
+        err && err.message
+          ? err.message
+          : String(err)
+    });
+  }
+}
+
+
+function jsonResponse_(obj) {
+  obj.backendVersion = BACKEND_VERSION;
+  if (obj.ok && obj.data && typeof obj.data === 'object') obj.data.backendVersion = BACKEND_VERSION;
+  return ContentService
+    .createTextOutput(
+      JSON.stringify(obj)
+    )
+    .setMimeType(
+      ContentService.MimeType.JSON
+    );
+}
+
+const FLIGHT_LOG_SS_ID =
+  '1tD003yx6BtwFIquQygztZvd4vppcBrT6RSPkMLOYkhs';
+
+
+/* =========================================================
+   CAPTAIN PROFILE
+========================================================= */
+
+function getCaptainProfile(payload) {
+
+  const captain =
+    String(
+      payload &&
+      payload.captain
+        ? payload.captain
+        : ''
+    ).trim();
+
+
+  if (!captain) {
+    throw new Error(
+      'Captain name is required.'
+    );
+  }
+
+
+  const ss =
+    openFlightSpreadsheet_(
+      FLIGHT_LOG_SS_ID
+    );
+
+
+  const captainSheet =
+    ss.getSheetByName(
+      'CAPTAIN_NOTES'
+    );
+
+
+  const masterSheet =
+    ss.getSheetByName(
+      'FLIGHT_LOG_MASTER'
+    );
+
+
+  if (
+    !captainSheet ||
+    !masterSheet
+  ) {
+    throw new Error(
+      'Required sheet not found.'
+    );
+  }
+
+
+  /* =====================================================
+     CAPTAIN MASTER NOTE
+     Header row = 3
+     A Captain
+     B Last flown
+     C LEG
+     D Last flight
+     E Last route
+     F Captain Comment
+     G Tags
+  ===================================================== */
+
+  const captainLastRow =
+    captainSheet.getLastRow();
+
+
+  const captainValues =
+    captainLastRow >= 4
+      ? captainSheet
+          .getRange(
+            4,
+            1,
+            captainLastRow - 3,
+            7
+          )
+          .getDisplayValues()
+      : [];
+
+
+  let captainRow = null;
+  let captainRowNumber = null;
+
+
+  for (
+    let i = 0;
+    i < captainValues.length;
+    i++
+  ) {
+
+    const row =
+      captainValues[i];
+
+
+    if (
+      normalizeCaptainName_(
+        row[0]
+      ) ===
+      normalizeCaptainName_(
+        captain
+      )
+    ) {
+
+      captainRow = row;
+      captainRowNumber =
+        i + 4;
+
+      break;
+    }
+  }
+
+
+  /* =====================================================
+     FLIGHT HISTORY
+     FLIGHT_LOG_MASTER
+     
+     A Log ID
+     B Date
+     E Flight
+     F DEP
+     G ARR
+     H Route
+     J Flight Comment
+     N PIC
+     AM Verification
+     BL Record Status
+  ===================================================== */
+
+  const masterLastRow =
+    masterSheet.getLastRow();
+
+
+  const flights = [];
+
+
+  if (
+    masterLastRow >= 2
+  ) {
+
+    const values =
+      readMasterRows_(masterSheet, masterLastRow, 64, { captain: captain });
+
+
+    for (
+      let i = 0;
+      i < values.length;
+      i++
+    ) {
+
+      const row =
+        values[i];
+
+
+      const pic =
+        row[13]; // N
+
+
+      if (
+        normalizeCaptainName_(
+          pic
+        ) !==
+        normalizeCaptainName_(
+          captain
+        )
+      ) {
+        continue;
+      }
+
+
+      flights.push({
+        logId:
+          row[0] || '',
+
+        date:
+          row[1] || '',
+
+        flight:
+          row[4] || '',
+
+        dep:
+          row[5] || '',
+
+        arr:
+          row[6] || '',
+
+        route:
+          row[7] ||
+          (
+            row[5] &&
+            row[6]
+              ? row[5] +
+                '-' +
+                row[6]
+              : ''
+          ),
+
+        flightComment:
+          row[9] || '',
+
+        verification:
+          row[38] || '',
+
+        recordStatus:
+          row[63] || '',
+      });
+    }
+  }
+
+
+  flights.sort(
+    function(a, b) {
+
+      return String(
+        b.date
+      ).localeCompare(
+        String(
+          a.date
+        )
+      );
+    }
+  );
+
+
+  /* =====================================================
+     COMPUTED CURRENT STATS
+  ===================================================== */
+
+  const lastFlight =
+    flights.length
+      ? flights[0]
+      : null;
+
+
+  const computed = {
+
+    sectors:
+      flights.length,
+
+    lastFlown:
+      lastFlight
+        ? lastFlight.date
+        : '',
+
+    lastFlight:
+      lastFlight
+        ? lastFlight.flight
+        : '',
+
+    lastRoute:
+      lastFlight
+        ? lastFlight.route
+        : '',
+  };
+
+
+  /* =====================================================
+     EXISTING MASTER NOTE
+  ===================================================== */
+
+  const profile = {
+
+    captain:
+      captain,
+
+    note:
+      captainRow
+        ? captainRow[5] || ''
+        : '',
+
+    tags:
+      captainRow
+        ? parseCaptainTags_(
+            captainRow[6]
+          )
+        : [],
+
+    captainRowNumber:
+      captainRowNumber,
+
+    computed:
+      computed,
+
+    stored: {
+
+      lastFlown:
+        captainRow
+          ? captainRow[1] || ''
+          : '',
+
+      sectors:
+        captainRow
+          ? captainRow[2] || ''
+          : '',
+
+      lastFlight:
+        captainRow
+          ? captainRow[3] || ''
+          : '',
+
+      lastRoute:
+        captainRow
+          ? captainRow[4] || ''
+          : '',
+    },
+
+    flights:
+      flights.slice(
+        0,
+        20
+      ),
+  };
+
+
+  return profile;
+}
+
+
+/* =========================================================
+   SAVE CAPTAIN PROFILE
+
+   Only user-owned fields:
+   F Captain Comment
+   G Tags
+
+   A-E are preserved / refreshed separately.
+========================================================= */
+
+function saveCaptainProfileUncached_(payload) {
+
+  const captain =
+    String(
+      payload &&
+      payload.captain
+        ? payload.captain
+        : ''
+    ).trim();
+
+
+  if (!captain) {
+    throw new Error(
+      'Captain name is required.'
+    );
+  }
+
+
+  const note =
+    String(
+      payload.note || ''
+    ).trim();
+
+
+  const tags =
+    Array.isArray(
+      payload.tags
+    )
+      ? payload.tags
+          .map(function(tag) {
+            return String(
+              tag
+            ).trim();
+          })
+          .filter(Boolean)
+      : [];
+
+
+  const ss =
+    openFlightSpreadsheet_(
+      FLIGHT_LOG_SS_ID
+    );
+
+
+  const sheet =
+    ss.getSheetByName(
+      'CAPTAIN_NOTES'
+    );
+
+
+  if (!sheet) {
+    throw new Error(
+      'CAPTAIN_NOTES not found.'
+    );
+  }
+
+
+  const lastRow =
+    sheet.getLastRow();
+
+
+  const values =
+    lastRow >= 4
+      ? sheet
+          .getRange(
+            4,
+            1,
+            lastRow - 3,
+            7
+          )
+          .getDisplayValues()
+      : [];
+
+
+  let targetRow = null;
+
+
+  for (
+    let i = 0;
+    i < values.length;
+    i++
+  ) {
+
+    if (
+      normalizeCaptainName_(
+        values[i][0]
+      ) ===
+      normalizeCaptainName_(
+        captain
+      )
+    ) {
+
+      targetRow =
+        i + 4;
+
+      break;
+    }
+  }
+
+
+  /* -----------------------------------------------------
+     New captain
+  ----------------------------------------------------- */
+
+  if (!targetRow) {
+
+    const profile =
+      getCaptainProfile({
+        captain:
+          captain
+      });
+
+
+    targetRow =
+      Math.max(
+        sheet.getLastRow() + 1,
+        4
+      );
+
+
+    sheet
+      .getRange(
+        targetRow,
+        1,
+        1,
+        7
+      )
+      .setValues([
+        [
+          captain,
+
+          profile.computed
+            .lastFlown ||
+          '',
+
+          profile.computed
+            .sectors ||
+          '',
+
+          profile.computed
+            .lastFlight ||
+          '',
+
+          profile.computed
+            .lastRoute ||
+          '',
+
+          note,
+
+          tags.join(', '),
+        ]
+      ]);
+
+  } else {
+
+    /*
+     * Existing captain:
+     * update ONLY user-owned note/tags.
+     * A-E stay untouched here.
+     */
+
+    sheet
+      .getRange(
+        targetRow,
+        6
+      )
+      .setValue(
+        note
+      );
+
+
+    sheet
+      .getRange(
+        targetRow,
+        7
+      )
+      .setValue(
+        tags.join(', ')
+      );
+  }
+
+
+  return {
+    success: true,
+    captain:
+      captain,
+    row:
+      targetRow,
+    note:
+      note,
+    tags:
+      tags,
+  };
+}
+
+
+/* =========================================================
+   HELPERS
+========================================================= */
+
+function normalizeCaptainName_(
+  value
+) {
+
+  return String(
+    value || ''
+  )
+    .trim()
+    .replace(
+      /\s+/g,
+      ' '
+    )
+    .toUpperCase();
+}
+
+
+function parseCaptainTags_(
+  value
+) {
+
+  if (!value) {
+    return [];
+  }
+
+
+  return String(
+    value
+  )
+    .split(',')
+    .map(function(tag) {
+      return tag.trim();
+    })
+    .filter(Boolean);
+}
+
+/* =========================================================
+   v0.2.5 DATA PRIORITY / IDENTITY SELF TEST — NO WRITE
+========================================================= */
+
+function testMasterIdentityV025() {
+
+  const mock = {
+    '2026-10-06|KE164|DYG|ICN': {
+      sheetRow: 100,
+      date: '2026-10-06',
+      flight: 'KE164',
+      dep: 'DYG',
+      arr: 'ICN',
+      eventId: 'evt-ke164',
+      recordStatus:
+        'OFFICIAL CONFIRMED'
+    }
+  };
+
+
+  const byId =
+    findExistingMasterByIdentity(
+      mock,
+      {
+        date: '2026-10-07',
+        flight: 'KE164',
+        dep: 'DYG',
+        arr: 'ICN',
+        eventId: 'evt-ke164'
+      }
+    );
+
+
+  if (
+    !byId ||
+    byId.sheetRow !== 100
+  ) {
+    throw new Error(
+      'MASTER IDENTITY TEST FAIL — Event ID'
+    );
+  }
+
+
+  const byAdjacentDate =
+    findExistingMasterByIdentity(
+      mock,
+      {
+        date: '2026-10-07',
+        flight: 'KE164',
+        dep: 'DYG',
+        arr: 'ICN'
+      }
+    );
+
+
+  if (
+    !byAdjacentDate ||
+    byAdjacentDate.sheetRow !== 100
+  ) {
+    throw new Error(
+      'MASTER IDENTITY TEST FAIL — adjacent date'
+    );
+  }
+
+
+  Logger.log(
+    'MASTER IDENTITY TEST PASS'
+  );
+}
+function getCaptains() {
+  const ss = openFlightSpreadsheet_(FLIGHT_LOG_SS_ID);
+  const captainSheet = ss.getSheetByName('CAPTAIN_NOTES');
+  const masterSheet = ss.getSheetByName('FLIGHT_LOG_MASTER');
+  if (!captainSheet || !masterSheet) throw new Error('Required sheet not found.');
+
+  const notesLastRow = captainSheet.getLastRow();
+  const notes = notesLastRow >= 4
+    ? captainSheet.getRange(4, 1, notesLastRow - 3, 7).getDisplayValues()
+    : [];
+  const byName = new Map();
+  notes.forEach(function(row) {
+    const captain = String(row[0] || '').trim();
+    const key = normalizeCaptainName_(captain);
+    // Match getCaptainProfile: the first normalized name owns note/tags.
+    if (!key || byName.has(key)) return;
+    byName.set(key, {
+      captain: captain,
+      note: row[5] || '',
+      tags: parseCaptainTags_(row[6]),
+      computed: { sectors: 0, lastFlown: '', lastFlight: '', lastRoute: '' }
+    });
+  });
+
+  const masterLastRow = masterSheet.getLastRow();
+  const flights = masterLastRow >= 2
+    ? masterSheet.getRange(2, 1, masterLastRow - 1, 14).getDisplayValues()
+    : [];
+  flights.forEach(function(row) {
+    const captain = byName.get(normalizeCaptainName_(row[13]));
+    if (!captain) return;
+    const stats = captain.computed;
+    const date = row[1] || '';
+    // Same flight inclusion and date ordering as getCaptainProfile.
+    if (stats.sectors === 0 || String(date).localeCompare(String(stats.lastFlown)) > 0) {
+      stats.lastFlown = date;
+      stats.lastFlight = row[4] || '';
+      stats.lastRoute = row[7] || (row[5] && row[6] ? row[5] + '-' + row[6] : '');
+    }
+    stats.sectors++;
+  });
+
+  return {
+    captains: Array.from(byName.values()).sort(function(a, b) {
+      return String(b.computed.lastFlown).localeCompare(String(a.computed.lastFlown)) ||
+        a.captain.localeCompare(b.captain);
+    })
+  };
+}
+
+
+/* v0.2.6: caches never supply write/identity decisions. */
+const BACKEND_VERSION = '0.2.8';
+const flightExecution_ = { spreadsheets: {}, masterIndex: null };
+
+function openFlightSpreadsheet_(id) {
+  if (!flightExecution_.spreadsheets[id]) {
+    flightExecution_.spreadsheets[id] = SpreadsheetApp.openById(id);
+  }
+  return flightExecution_.spreadsheets[id];
+}
+
+function buildMasterIndex() {
+  if (!flightExecution_.masterIndex) flightExecution_.masterIndex = buildMasterIndexUncached_();
+  return flightExecution_.masterIndex;
+}
+
+function flightCacheGeneration_() {
+  return PropertiesService.getScriptProperties().getProperty('FLT_CACHE_GENERATION') || 'initial';
+}
+
+function cachedFlightRead_(action, payload, read) {
+  // Authentication is already checked in doPost before entering here.
+  // Manual/external sheet edits become visible within this short TTL.
+  const ttl = action === 'getCaptains' ? 120 : 30;
+  let cache, generation, key;
+  try {
+    cache = CacheService.getScriptCache();
+    generation = flightCacheGeneration_();
+    const identity = action === 'getHistoryMonth' ? [Number(payload.year), Number(payload.month)]
+      : (action === 'getCaptainProfile' || action === 'getCaptainCard') ? [normalizeCaptainName_(payload.captain)] : [];
+    const digest = Utilities.base64EncodeWebSafe(Utilities.computeDigest(
+      Utilities.DigestAlgorithm.SHA_256, JSON.stringify(identity), Utilities.Charset.UTF_8));
+    key = 'flt:' + BACKEND_VERSION + ':' + generation + ':' + action + ':' + digest;
+    if (!payload.__fresh) {
+      const hit = cache.get(key);
+      if (hit) return JSON.parse(hit);
+    }
+  } catch (ignored) { cache = null; }
+  const result = read();
+  try {
+    const serialized = JSON.stringify(result);
+    // Conservative UTF-8 size bound below CacheService's per-entry limit.
+    // A concurrent write changes generation; old reads cannot seed the new cache.
+    if (cache && serialized.length * 3 < 90000 && generation === flightCacheGeneration_()) {
+      cache.put(key, serialized, ttl);
+    }
+  } catch (ignored) { /* Cache failure must not fail a sheet read. */ }
+  return result;
+}
+
+function invalidateFlightCache_() {
+  flightExecution_.masterIndex = null;
+  PropertiesService.getScriptProperties().setProperty('FLT_CACHE_GENERATION', Utilities.getUuid());
+}
+
+function withFlightMutation_(write) {
+  // Invalidate on entry AND exit, including partially failed writes.
+  invalidateFlightCache_();
+  try { return write(); }
+  finally {
+    try { SpreadsheetApp.flush(); }
+    finally { invalidateFlightCache_(); }
+  }
+}
+
+function savePostFlight(payload) {
+  return withFlightMutation_(function() { return savePostFlightUncached_(payload); });
+}
+
+function syncScheduleQueueFromFltSch() {
+  return withFlightMutation_(function() { return syncScheduleQueueFromFltSchUncached_(); });
+}
+
+function reconcileOfficialFlightRecord(official) {
+  return withFlightMutation_(function() { return reconcileOfficialFlightRecordUncached_(official); });
+}
+
+function saveCaptainProfile(payload) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const result = withFlightMutation_(function() { return saveCaptainProfileUncached_(payload); });
+    // Return the current profile in the save response: no second HTTP round trip.
+    result.profile = getCaptainProfile(payload);
+    return result;
+  } finally { lock.releaseLock(); }
+}
+
+
+/* v0.2.7: narrow selectors, then bounded contiguous reads.
+ * No persistent row-number cache: external inserts/reordering cannot leave a stale index.
+ * Unselected positions remain empty arrays so original physical row numbers are preserved.
+ * Write paths pass no selector and continue to read the complete, current Master.
+ */
+function getCaptainCard(payload) {
+  const captain = String(payload.captain || '').trim();
+  if (!captain) throw new Error('Captain name is required.');
+  const sheet = openFlightSpreadsheet_(FLIGHT_LOG_SS_ID).getSheetByName('CAPTAIN_NOTES');
+  if (!sheet) throw new Error('CAPTAIN_NOTES not found.');
+  const last = sheet.getLastRow();
+  const values = last >= 4 ? sheet.getRange(4, 1, last - 3, 7).getDisplayValues() : [];
+  const key = normalizeCaptainName_(captain);
+  const row = values.find(function(item) { return normalizeCaptainName_(item[0]) === key; });
+  return { captain: captain, note: row ? row[5] || '' : '', tags: row ? parseCaptainTags_(row[6]) : [] };
+}
+
+function readMasterRows_(sheet, lastRow, width, selection) {
+  const count = lastRow - 1;
+  if (count <= 0) return [];
+  const fullRead = function() {
+    // Widely scattered captain histories should not trigger many tiny reads.
+    // Profile uses only A:N, AM and BL: retain column positions, read 16 instead of 64.
+    if (selection && selection.captain && count > 128) {
+      const base = sheet.getRange(2, 1, count, 14).getDisplayValues();
+      const verification = sheet.getRange(2, MASTER_COL.VERIFICATION, count, 1).getDisplayValues();
+      const status = sheet.getRange(2, MASTER_COL.RECORD_STATUS, count, 1).getDisplayValues();
+      return base.map(function(row, i) {
+        const projected = Array(width).fill('');
+        row.forEach(function(value, col) { projected[col] = value; });
+        projected[MASTER_COL.VERIFICATION - 1] = verification[i][0];
+        projected[MASTER_COL.RECORD_STATUS - 1] = status[i][0];
+        return projected;
+      });
+    }
+    return sheet.getRange(2, 1, count, width).getDisplayValues();
+  };
+  // For small sheets an extra selector round trip would cost more than it saves.
+  if (!selection || count <= 128) return fullRead();
+
+  let selected;
+  if (selection.captain) {
+    const key = normalizeCaptainName_(selection.captain);
+    selected = sheet.getRange(2, MASTER_COL.PIC, count, 1).getDisplayValues()
+      .map(function(row) { return normalizeCaptainName_(row[0]) === key; });
+  } else {
+    const dates = sheet.getRange(2, MASTER_COL.DATE, count, 1).getDisplayValues()
+      .map(function(row) { return normalizeDateString(row[0]); });
+    if (selection.month) {
+      selected = dates.map(function(date) { return date.startsWith(selection.month + '-'); });
+    } else if (selection.recency) {
+      const today = Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'yyyy-MM-dd');
+      const start = utcDateToString(addUtcDays(dateStringToUtc(today), -(CONFIG.RECENCY_DAYS - 1)));
+      selected = dates.map(function(date) { return date >= start && date <= today; });
+    } else if (selection.queueRows) {
+      const wantedDates = new Set();
+      const wantedEvents = new Set();
+      const wantedLogIds = new Set();
+      selection.queueRows.forEach(function(row) {
+        const date = normalizeDateString(row[QUEUE_COL.DATE - 1]);
+        if (date) {
+          const utc = dateStringToUtc(date);
+          [-1, 0, 1].forEach(function(offset) { wantedDates.add(utcDateToString(addUtcDays(utc, offset))); });
+        }
+        const logId = String(row[QUEUE_COL.MASTER_LOG_ID - 1] || '').trim();
+        if (logId) wantedLogIds.add(logId);
+        const event = String(row[QUEUE_COL.EVENT_ID - 1] || '').trim();
+        if (event) wantedEvents.add(event);
+      });
+      if (wantedEvents.size) {
+        const events = sheet.getRange(2, MASTER_COL.EVENT_ID, count, 1).getDisplayValues();
+        events.forEach(function(row, i) {
+          // Include ALL rows on an Event-ID match's date, preserving duplicate-key
+          // overwrite order and ambiguous adjacent-day matching exactly as before.
+          if (wantedEvents.has(String(row[0] || '').trim()) && dates[i]) wantedDates.add(dates[i]);
+        });
+      }
+      // Select referenced IDs regardless of the Calendar/Official date gap.
+      const logIds = wantedLogIds.size
+        ? sheet.getRange(2, MASTER_COL.LOG_ID, count, 1).getDisplayValues()
+        : [];
+      selected = dates.map(function(date, i) {
+        return wantedDates.has(date) || (logIds[i] && wantedLogIds.has(String(logIds[i][0] || '').trim()));
+      });
+    } else { return fullRead(); }
+  }
+
+  const spans = [];
+  let matches = 0;
+  selected.forEach(function(yes, i) {
+    if (!yes) return;
+    matches++;
+    const previous = spans[spans.length - 1];
+    // Read a few intervening rows rather than issuing many tiny Sheets calls.
+    if (previous && i - previous.end <= 9) previous.end = i;
+    else spans.push({ start: i, end: i });
+  });
+  const rows = Array.from({ length: count }, function() { return []; });
+  if (!matches) {
+    const latest = sheet.getLastRow();
+    return latest !== lastRow
+      ? (latest >= 2 ? sheet.getRange(2, 1, latest - 1, width).getDisplayValues() : [])
+      : rows;
+  }
+  if (spans.length > 8) {
+    const bound = { start: spans[0].start, end: spans[spans.length - 1].end };
+    spans.splice(0, spans.length, bound);
+  }
+  const hydrated = spans.reduce(function(total, span) { return total + span.end - span.start + 1; }, 0);
+  if (hydrated >= count * 0.6) return fullRead();
+  spans.forEach(function(span) {
+    const values = sheet.getRange(span.start + 2, 1, span.end - span.start + 1, width).getDisplayValues();
+    values.forEach(function(row, i) { rows[span.start + i] = row; });
+  });
+  // Row-count changes during selection require a new snapshot. Never use this data for writes.
+  const currentLastRow = sheet.getLastRow();
+  if (currentLastRow !== lastRow) {
+    return currentLastRow >= 2 ? sheet.getRange(2, 1, currentLastRow - 1, width).getDisplayValues() : [];
+  }
+  return rows;
+}

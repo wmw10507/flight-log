@@ -18,3 +18,21 @@ The response is `{ captains: [{ captain, note, tags, computed: { sectors, lastFl
 - Each sheet is read once. No sheet data is written by this action.
 
 The function and dispatcher were applied to the existing cloud project and deployed as version **23** on **2026-10-06 (Asia/Seoul)**. The existing deployment ID/URL, authentication, execution identity, and access settings were preserved. No changes to Vercel environment variables are needed. GitHub/Vercel continues to deploy the Next.js app through its existing workflow.
+
+
+## Master Log ID fix (v0.2.8)
+
+Code.gs is the complete backend source, imported from the existing Myungwoo Flight Log Backend editor on 2026-10-14 (Asia/Seoul). Before modification it matched the local v0.2.7 replacement byte-for-byte in length and content fingerprint (94,658 characters; FNV-1a 3365260425). The initial source comparison was read only. Deployment and live validation followed explicit user authorization.
+
+- Today and savePostFlight share findMasterForQueue_: a nonblank SCHEDULE_QUEUE column M Master Log ID resolves only FLIGHT_LOG_MASTER column A. Missing or duplicated IDs do not fall back; saving stops before any sheet write.
+- Queue rows without an ID use the exact Date + Flight + DEP + ARR legacy key. Event ID/adjacent-day matching remains available for the separate official reconciliation path, but no longer decides Today/save row ownership.
+- The Log ID index retains physical rows even when legacy tuple keys collide. Selective Today reads include referenced IDs outside the Queue date window. Save continues to use a full, fresh Master index under the existing lock.
+- Today preserves Calendar date in date and exposes the matched official date separately in officialDate. Official GMT clock values are converted to KST for the existing OUT/IN displays; Block, Company and MOLIT come from that same matched row. Calendar timestamps still determine schedule ordering/completion. No dates or official timestamps are rewritten.
+- The client sends its displayed Master ID as an optional stale-link check. The server selects the Queue row by eventId and re-reads its ID; client input cannot redirect a write. The save response keeps the client ID current after provisional creation.
+- Existing updateExistingMasterRow is unchanged: Approach type/no, PF/PM override, comment and their mirrors plus post-flight completion are written. Official T/O, L/D and every other official/provenance column are preserved. Explicit provisional T/O, L/D editing remains supported. Captain comment/tags saving is unchanged.
+
+Local verification: npm test, npm run typecheck, npm run build. Tests use in-memory Apps Script/Sheets mocks and never contact production.
+
+Backend deployed on 2026-10-14 at 10:34 (Asia/Seoul) as Apps Script version 27, retaining the existing deployment ID/URL, execution identity and access settings. Production /api/flight reports backendVersion 0.2.8. A live save of KE164 with its existing user values returned UPDATED for KAL-20261006-KE164-DYG-ICN and official: true. Independent before/after reads of Master A135:BR136 (KE163/KE164, 70 columns each) and Queue A16:N17 were identical. The current Today seven-day window no longer includes KE164; its live History/API and save path were verified, with Today hydration covered by local regression tests.
+
+For future backend deployments, replace that project's Code.gs with this file and retain Index.html. Code.gs already includes getCaptains; the separate getCaptains.gs here is a historical additive snippet and must not be uploaded alongside it. GitHub/Vercel continues to deploy the Next.js app from main.

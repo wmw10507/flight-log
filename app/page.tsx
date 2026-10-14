@@ -20,6 +20,12 @@ type Theme = "light" | "dark";
 
 type Flight = {
   eventId?: string;
+  masterLogId?: string;
+  officialDate?: string;
+  outGmt?: string;
+  inGmt?: string;
+  company?: string;
+  molit?: string;
 
   date: string;
   day?: number;
@@ -152,7 +158,7 @@ function captainKey(name: string) {
    API
 ========================================================= */
 
-const APP_VERSION = "0.2.7";
+const APP_VERSION = "0.2.8";
 const readActions = new Set(["getAppData", "getHistoryMonth", "getRecencyData", "getCaptains", "getCaptainProfile", "getCaptainCard"]);
 const clientReads = new Map<string, { value: unknown; expires: number }>();
 const pendingReads = new Map<string, Promise<any>>();
@@ -1103,6 +1109,8 @@ export default function Home() {
               selectedFlight
                 .eventId,
 
+            masterLogId: selectedFlight.masterLogId,
+
             pfpmOverride:
               pfpm,
 
@@ -1140,6 +1148,7 @@ export default function Home() {
 
               return {
                 ...f,
+                masterLogId: result?.logId || f.masterLogId,
 
                 postFlightStatus:
                   "COMPLETE",
