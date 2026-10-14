@@ -5595,7 +5595,7 @@ function getCaptains() {
 
 
 /* v0.2.6: caches never supply write/identity decisions. */
-const BACKEND_VERSION = '0.3.0-import-v1';
+const BACKEND_VERSION = '0.3.1-import-v1';
 const flightExecution_ = { spreadsheets: {}, masterIndex: null };
 
 function openFlightSpreadsheet_(id) {
@@ -5824,7 +5824,15 @@ function previewOfficialImport(payload) {
 }
 
 
+function requireOfficialImportConfirmEnabled_() {
+  if (PropertiesService.getScriptProperties().getProperty('OFFICIAL_IMPORT_CONFIRM_ENABLED') !== 'true') {
+    throw new Error('Official Import Confirm is disabled in Apps Script. Analyze remains read-only.');
+  }
+}
+
 function confirmOfficialImport(payload) {
+  // Check before lock acquisition, cache invalidation, or any Drive/Sheet write.
+  requireOfficialImportConfirmEnabled_();
   const lock = LockService.getScriptLock();
   lock.waitLock(30000);
 
@@ -7110,6 +7118,7 @@ function optimizeOfficialPdfCoverage_(documentSheet) {
 
 
 function confirmOfficialImportUncached_(payload) {
+  requireOfficialImportConfirmEnabled_();
   const source = validateOfficialImportPayload_(payload, true);
   const preview = buildOfficialImportPreview_(payload);
 

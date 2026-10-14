@@ -6,11 +6,25 @@ const APPS_SCRIPT_URL =
 const API_KEY =
   process.env.FLIGHT_LOG_API_KEY;
 
+// Official imports must use their dedicated, gated endpoint.
+const ALLOWED_ACTIONS = new Set([
+  "getAppData", "savePostFlight", "getHistoryMonth", "getRecencyData",
+  "getCaptainCard", "getCaptains", "getCaptainProfile", "saveCaptainProfile",
+]);
+
 
 export async function POST(
   request: NextRequest
 ) {
   try {
+    const body = await request.json();
+    if (!body || typeof body.action !== "string" || !ALLOWED_ACTIONS.has(body.action)) {
+      return NextResponse.json(
+        { error: "Action is not allowed through the Flight API." },
+        { status: 403 }
+      );
+    }
+
     if (!APPS_SCRIPT_URL) {
       throw new Error(
         "APPS_SCRIPT_URL is not configured."
@@ -22,9 +36,6 @@ export async function POST(
         "FLIGHT_LOG_API_KEY is not configured."
       );
     }
-
-    const body =
-      await request.json();
 
     const response =
       await fetch(

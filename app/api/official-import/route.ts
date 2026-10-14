@@ -124,6 +124,12 @@ export async function POST(request: NextRequest) {
     if (mode !== "analyze" && mode !== "confirm") {
       throw new Error("Invalid import mode.");
     }
+    if (mode === "confirm" && !CONFIRM_ENABLED) {
+      return NextResponse.json(
+        { error: "Official Import Confirm is disabled on this deployment. Analyze remains read-only." },
+        { status: 403 }
+      );
+    }
     if (!(file instanceof File)) {
       throw new Error("PDF file is required.");
     }
@@ -153,12 +159,6 @@ export async function POST(request: NextRequest) {
         preview,
         confirmEnabled: CONFIRM_ENABLED,
       });
-    }
-
-    if (!CONFIRM_ENABLED) {
-      throw new Error(
-        "Official Import Confirm is disabled on this deployment. Analyze remains read-only."
-      );
     }
 
     if (parsed.warnings.length) {

@@ -93,3 +93,9 @@ The Next.js route uses `unpdf@1.8.1` and therefore requires Node.js 22 or newer.
 The Apps Script deployment now uses `DriveApp` for backup/original-file management. The first deployment of this version may require Google OAuth re-authorization for Drive access. Re-deploy the existing web app only after reviewing the new Drive scope; preserve the current deployment identity, access policy, and `FLIGHT_LOG_API_KEY`.
 
 Do not upload `getCaptains.gs` separately; `Code.gs` remains the complete backend source.
+
+### Confirm guard (v0.3.1-import-v1)
+
+The generic `/api/flight` bridge permits only existing app actions and rejects all Official Import actions. Official imports use the dedicated route, whose Vercel `OFFICIAL_IMPORT_CONFIRM_ENABLED` flag rejects Confirm before PDF extraction when unset/false.
+
+Apps Script independently requires its own Script Property `OFFICIAL_IMPORT_CONFIRM_ENABLED` to equal `true`. Both Confirm entry points check this before any lock/cache/Sheet/Drive mutation. Missing, false, and other values fail closed. Preview does not require this property. Keep both switches OFF until a separately authorized actual import test.
