@@ -6110,39 +6110,39 @@ function findQueueForOfficial_(queueRows, official) {
 
 
 function findMasterForOfficial_(masterRows, official, queueMatch) {
+  const rowsWithLocation = masterRows.map(function(row, index) {
+    return { row: row, sheetRow: index + 2 };
+  });
+
   const candidatesByLogId = function(logId) {
     if (!logId) return [];
-    return masterRows.map(function(row, index) {
-      return { row: row, sheetRow: index + 2 };
-    }).filter(function(item) {
-      return String(item.row[MASTER_COL.LOG_ID - 1] || '').trim() === String(logId).trim();
+    return rowsWithLocation.filter(function(item) {
+      return String(item.row[MASTER_COL.LOG_ID - 1] || '').trim() ===
+        String(logId).trim();
     });
   };
 
+  // Queue → Master Log ID is the only direct identity link. If it exists,
+  // it must resolve uniquely; never fall back from a broken explicit link.
   if (queueMatch && queueMatch.row) {
-    const linkedId = String(queueMatch.row[QUEUE_COL.MASTER_LOG_ID - 1] || '').trim();
+    const linkedId = String(
+      queueMatch.row[QUEUE_COL.MASTER_LOG_ID - 1] || ''
+    ).trim();
+
     if (linkedId) {
       const linked = candidatesByLogId(linkedId);
-      if (linked.length === 1) return { match: linked[0], ambiguous: false };
+
+      if (linked.length === 1) {
+        return { match: linked[0], ambiguous: false };
+      }
+
       return {
         match: null,
         ambiguous: true,
-        reason: linked.length ? 'Queue Master Log ID is duplicated.' : 'Queue Master Log ID does not exist in Master.'
+        reason: linked.length
+          ? 'Queue Master Log ID is duplicated.'
+          : 'Queue Master Log ID does not exist in Master.'
       };
-    }
-
-    const eventId = String(queueMatch.row[QUEUE_COL.EVENT_ID - 1] || '').trim();
-    if (eventId) {
-      const eventMatches = masterRows.map(function(row, index) {
-        return { row: row, sheetRow: index + 2 };
-      }).filter(function(item) {
-        return String(item.row[MASTER_COL.EVENT_ID - 1] || '').trim() === eventId;
-      });
-
-      if (eventMatches.length === 1) return { match: eventMatches[0], ambiguous: false };
-      if (eventMatches.length > 1) {
-        return { match: null, ambiguous: true, reason: 'Calendar Event ID is duplicated in Master.' };
-      }
     }
   }
 
@@ -6151,10 +6151,12 @@ function findMasterForOfficial_(masterRows, official, queueMatch) {
   const dep = String(official.dep || '').trim().toUpperCase();
   const arr = String(official.arr || '').trim().toUpperCase();
 
-  const tupleCandidates = masterRows.map(function(row, index) {
-    return { row: row, sheetRow: index + 2 };
-  }).filter(function(item) {
+  // Without an explicit Master Log ID, identity is constrained by the
+  // actual flight tuple first. A stale/reused Calendar Event ID must never
+  // redirect an official import to a different flight or route.
+  const tupleCandidates = rowsWithLocation.filter(function(item) {
     const row = item.row;
+
     return normalizeFlightNo(row[MASTER_COL.FLIGHT - 1]) === flight &&
       String(row[MASTER_COL.DEP - 1] || '').trim().toUpperCase() === dep &&
       String(row[MASTER_COL.ARR - 1] || '').trim().toUpperCase() === arr;
@@ -6164,19 +6166,63 @@ function findMasterForOfficial_(masterRows, official, queueMatch) {
     return normalizeDateString(item.row[MASTER_COL.DATE - 1]) === date;
   });
 
-  if (exact.length === 1) return { match: exact[0], ambiguous: false };
-  if (exact.length > 1) return { match: null, ambiguous: true, reason: 'Exact Master key is duplicated.' };
+  if (exact.length === 1) {
+    return { match: exact[0], ambiguous: false };
+  }
 
   const adjacent = tupleCandidates.filter(function(item) {
     return adjacentCalendarDate(item.row[MASTER_COL.DATE - 1], date);
   });
 
-  if (adjacent.length === 1) return { match: adjacent[0], ambiguous: false };
-  if (adjacent.length > 1) return { match: null, ambiguous: true, reason: 'Multiple adjacent-date Master rows match.' };
+  const compatible = exact.length ? exact : adjacent;
+
+  if (compatible.length === 1) {
+    return { match: compatible[0], ambiguous: false };
+  }
+
+  if (compatible.length > 1 && queueMatch && queueMatch.row) {
+    const eventId = String(
+      queueMatch.row[QUEUE_COL.EVENT_ID - 1] || ''
+    ).trim();
+
+    if (eventId) {
+      const eventMatches = compatible.filter(function(item) {
+        return String(item.row[MASTER_COL.EVENT_ID - 1] || '').trim() ===
+          eventId;
+      });
+
+      if (eventMatches.length === 1) {
+        return { match: eventMatches[0], ambiguous: false };
+      }
+
+      if (eventMatches.length > 1) {
+        return {
+          match: null,
+          ambiguous: true,
+          reason: 'Calendar Event ID is duplicated among compatible Master rows.'
+        };
+      }
+    }
+  }
+
+  if (exact.length > 1) {
+    return {
+      match: null,
+      ambiguous: true,
+      reason: 'Exact Master key is duplicated.'
+    };
+  }
+
+  if (adjacent.length > 1) {
+    return {
+      match: null,
+      ambiguous: true,
+      reason: 'Multiple adjacent-date Master rows match.'
+    };
+  }
 
   return { match: null, ambiguous: false };
 }
-
 
 function sourceRegisterEntry_(row, sheetRow, exactHash) {
   const verification = String(row[6] || '').trim();
