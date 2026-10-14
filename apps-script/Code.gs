@@ -6669,7 +6669,14 @@ function updateDocumentRegisterStorage_(sheet, rowNumber, source, fileInfo, stor
 function setDurationCell_(sheet, row, col, value) {
   const fraction = durationFraction_(value);
   if (fraction === '') return;
-  sheet.getRange(row, col).setValue(fraction);
+  sheet.getRange(row, col).setNumberFormat('[h]:mm').setValue(fraction);
+}
+
+// Run once in the editor after adding official import to authorize storage.
+// Requests consent and reads the existing folder; never writes data or files.
+function authorizeOfficialImportStorage() {
+  ScriptApp.requireScopes(ScriptApp.AuthMode.FULL, ['https://www.googleapis.com/auth/drive']);
+  console.log(DriveApp.getFolderById(CONFIG.OFFICIAL_ACTIVE_FOLDER_ID).getName());
 }
 
 
@@ -6683,6 +6690,11 @@ function appendRemark_(sheet, row, note) {
 function applyOfficialToExistingRow_(sheet, item, sourceId) {
   const row = item.masterRow;
   const official = item.record;
+
+  // Provisional rows may have General formatting on previously blank credit cells.
+  [MASTER_COL.DAY, MASTER_COL.IFR, MASTER_COL.SIC, MASTER_COL.SAFETY_CREDIT].forEach(function(col) {
+    sheet.getRange(row, col).setNumberFormat('[h]:mm');
+  });
 
   sheet.getRange(row, MASTER_COL.REG).setValue(official.registration);
   sheet.getRange(row, MASTER_COL.DUTY).setValue(official.dutyCode);

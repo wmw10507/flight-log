@@ -95,6 +95,7 @@ const official = {
 
 function env(masterRows, queueRows, documentRows = []) {
   const writes = [];
+  const formats = new Map();
   const data = {
     FLIGHT_LOG_MASTER: masterRows,
     SCHEDULE_QUEUE: queueRows,
@@ -107,7 +108,7 @@ function env(masterRows, queueRows, documentRows = []) {
 
     function valueAt(row, col) {
       const value = sheetData[row - 2]?.[col - 1] ?? "";
-      if (typeof value === "number" && [17,18,19,21,22].includes(col)) {
+      if (typeof value === "number" && formats.get(`${name}:${row}:${col}`) === '[h]:mm') {
         const mins = Math.round(value * 1440);
         return Math.floor(mins / 60) + ":" + String(mins % 60).padStart(2, "0");
       }
@@ -115,6 +116,10 @@ function env(masterRows, queueRows, documentRows = []) {
     }
 
     return {
+      setNumberFormat(format) {
+        formats.set(`${name}:${r}:${c}`, format);
+        return this;
+      },
       getDisplayValues() {
         return Array.from({ length: n }, (_, i) =>
           Array.from({ length: w }, (_, j) => valueAt(r + i, c + j))
