@@ -5869,19 +5869,52 @@ function validateOfficialImportPayload_(payload, requirePdf) {
     }
   }
 
+  const sourceKeys = {};
+  const sourceDates = [];
+
   payload.records.forEach(function(record, index) {
     const date = normalizeDateString(record && record.date);
     const flight = normalizeFlightNo(record && record.flight);
     const dep = String(record && record.dep || '').trim().toUpperCase();
     const arr = String(record && record.arr || '').trim().toUpperCase();
+    const outGmt = normalizeClock_(record && record.outGmt);
+    const inGmt = normalizeClock_(record && record.inGmt);
 
     if (!date || !flight || !dep || !arr) {
       throw new Error('Official record key is incomplete at index ' + index + '.');
     }
+
+    const sourceKey = [date, flight, dep, arr, outGmt, inGmt].join('|');
+    if (sourceKeys[sourceKey]) {
+      throw new Error('Duplicate official source row: ' + sourceKey);
+    }
+    sourceKeys[sourceKey] = true;
+    sourceDates.push(date);
   });
 
+  sourceDates.sort();
+
+  if (
+    sourceDates[0] !== coverageFrom ||
+    sourceDates[sourceDates.length - 1] !== coverageTo
+  ) {
+    throw new Error('Official PDF coverage does not match parsed source rows.');
+  }
+
+  if (
+    Number(source.sectorCount || payload.records.length) !==
+    payload.records.length
+  ) {
+    throw new Error('Official PDF sector count does not match parsed source rows.');
+  }
+
+  const fileName = String(source.fileName || 'Flight Log Report.pdf').trim();
+  if (!/\.pdf$/i.test(fileName)) {
+    throw new Error('Official source must retain its PDF filename.');
+  }
+
   return {
-    fileName: String(source.fileName || 'Flight Log Report.pdf').trim(),
+    fileName: fileName,
     mimeType: 'application/pdf',
     fileSize: Number(source.fileSize || 0),
     sha256: sha256,
@@ -6244,6 +6277,9 @@ function buildOfficialImportPreview_(payload) {
     if (queueResult.ambiguous || masterResult.ambiguous) {
       status = 'MISMATCH';
       reason = queueResult.reason || masterResult.reason || 'Ambiguous identity.';
+    } else if (excluded && masterMatch) {
+      status = 'MISMATCH';
+      reason = 'Deadhead/travel evidence unexpectedly has an operating Master row.';
     } else if (excluded) {
       status = 'EXCLUDED';
       reason = 'Deadhead/travel evidence is not credited as an operating Master sector.';
@@ -6331,25 +6367,76 @@ function createOfficialImportBackup_() {
 }
 
 
-function ensureOfficialStagingFolder_() {
-  const active = DriveApp.getFolderById(CONFIG.OFFICIAL_ACTIVE_FOLDER_ID);
-  const folders = active.getFoldersByName(CONFIG.OFFICIAL_STAGING_FOLDER_NAME);
-  return folders.hasNext()
-    ? folders.next()
-    : active.createFolder(CONFIG.OFFICIAL_STAGING_FOLDER_NAME);
+function getOrCreateChildFolder_(parent, name) {
+  const matches = parent.getFoldersByName(name);
+  return matches.hasNext() ? matches.next() : parent.createFolder(name);
+}
+
+
+function getOfficialStorageFolders_(year) {
+  // Bootstrap from the verified 2026 Flight Log Report folder, then walk up to
+  // Korean Air so future years use the same hierarchy without hard-coded IDs.
+  const bootstrapActive = DriveApp.getFolderById(CONFIG.OFFICIAL_ACTIVE_FOLDER_ID);
+  const yearParents = bootstrapActive.getParents();
+
+  if (!yearParents.hasNext()) {
+    throw new Error('Official storage year folder is missing.');
+  }
+
+  const bootstrapYear = yearParents.next();
+  const airlineParents = bootstrapYear.getParents();
+
+  if (!airlineParents.hasNext()) {
+    throw new Error('Korean Air official storage folder is missing.');
+  }
+
+  const airlineFolder = airlineParents.next();
+  const targetYear = getOrCreateChildFolder_(airlineFolder, String(year));
+  const active = getOrCreateChildFolder_(targetYear, 'Flight Log Report');
+  const archive = getOrCreateChildFolder_(active, 'Archive_Redundant');
+  const staging = getOrCreateChildFolder_(active, CONFIG.OFFICIAL_STAGING_FOLDER_NAME);
+
+  return {
+    airline: airlineFolder,
+    year: targetYear,
+    active: active,
+    archive: archive,
+    staging: staging
+  };
+}
+
+
+function sha256HexBytes_(bytes) {
+  const digest = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.SHA_256,
+    bytes
+  );
+
+  return digest.map(function(value) {
+    const unsigned = value < 0 ? value + 256 : value;
+    return ('0' + unsigned.toString(16)).slice(-2);
+  }).join('');
 }
 
 
 function createStagedOfficialPdf_(source, base64) {
-  const staging = ensureOfficialStagingFolder_();
   const bytes = Utilities.base64Decode(String(base64 || ''));
+  const actualHash = sha256HexBytes_(bytes);
+
+  if (actualHash !== String(source.sha256 || '').toLowerCase()) {
+    throw new Error('Original PDF checksum does not match analyzed source.');
+  }
+
+  const year = String(source.coverageTo || '').slice(0, 4);
+  const storage = getOfficialStorageFolders_(year);
   const blob = Utilities.newBlob(bytes, 'application/pdf', source.fileName);
-  const file = staging.createFile(blob);
+  const file = storage.staging.createFile(blob);
 
   return {
     id: file.getId(),
     url: file.getUrl(),
-    file: file
+    file: file,
+    storage: storage
   };
 }
 
@@ -6697,46 +6784,43 @@ function extractDriveFileIdFromNotes_(notes) {
 }
 
 
-function mapFolderFiles_(folder, storage) {
-  const mapById = {};
-  const mapByName = {};
-  const iterator = folder.getFiles();
+function physicalFileInfo_(file, yearStorage) {
+  const parents = file.getParents();
+  let parentId = '';
+  let parentName = '';
 
-  while (iterator.hasNext()) {
-    const file = iterator.next();
-    const info = {
-      file: file,
-      id: file.getId(),
-      name: file.getName(),
-      url: file.getUrl(),
-      storage: storage
-    };
-
-    mapById[info.id] = info;
-    if (!mapByName[info.name]) mapByName[info.name] = [];
-    mapByName[info.name].push(info);
+  if (parents.hasNext()) {
+    const parent = parents.next();
+    parentId = parent.getId();
+    parentName = parent.getName();
   }
 
-  return { byId: mapById, byName: mapByName };
+  let storage = 'OTHER';
+  if (parentId === yearStorage.active.getId()) storage = 'ACTIVE';
+  if (parentId === yearStorage.archive.getId()) storage = 'ARCHIVED_REDUNDANT';
+  if (parentId === yearStorage.staging.getId()) storage = 'STAGING';
+
+  return {
+    file: file,
+    id: file.getId(),
+    name: file.getName(),
+    url: file.getUrl(),
+    parentId: parentId,
+    parentName: parentName,
+    storage: storage
+  };
 }
 
 
-function mergeFileMaps_(a, b) {
-  const byId = {};
-  const byName = {};
+function findLegacyPhysicalFile_(fileName, yearStorage) {
+  const candidates = [];
 
-  [a, b].forEach(function(map) {
-    Object.keys(map.byId).forEach(function(id) {
-      byId[id] = map.byId[id];
-    });
-
-    Object.keys(map.byName).forEach(function(name) {
-      if (!byName[name]) byName[name] = [];
-      byName[name] = byName[name].concat(map.byName[name]);
-    });
+  [yearStorage.active, yearStorage.archive].forEach(function(folder) {
+    const matches = folder.getFilesByName(fileName);
+    while (matches.hasNext()) candidates.push(matches.next());
   });
 
-  return { byId: byId, byName: byName };
+  return candidates.length === 1 ? candidates[0] : null;
 }
 
 
@@ -6788,19 +6872,20 @@ function selectMinimalCoverageIntervals_(intervals) {
 
 
 function optimizeOfficialPdfCoverage_(documentSheet) {
-  const activeFolder = DriveApp.getFolderById(CONFIG.OFFICIAL_ACTIVE_FOLDER_ID);
-  const archiveFolder = DriveApp.getFolderById(CONFIG.OFFICIAL_ARCHIVE_FOLDER_ID);
-  const files = mergeFileMaps_(
-    mapFolderFiles_(activeFolder, 'ACTIVE'),
-    mapFolderFiles_(archiveFolder, 'ARCHIVED_REDUNDANT')
-  );
-
   const rows = documentSheet.getLastRow() >= 2
     ? documentSheet.getRange(2, 1, documentSheet.getLastRow() - 1, 9).getDisplayValues()
     : [];
 
   const intervals = [];
   const warnings = [];
+  const storageCache = {};
+
+  function storageForYear(year) {
+    if (!storageCache[year]) {
+      storageCache[year] = getOfficialStorageFolders_(year);
+    }
+    return storageCache[year];
+  }
 
   rows.forEach(function(row, index) {
     if (String(row[1] || '').trim() !== 'Flight Log Report') return;
@@ -6808,23 +6893,40 @@ function optimizeOfficialPdfCoverage_(documentSheet) {
     const coverage = parseCoverage_(row[4]);
     if (!coverage) return;
 
+    const issueYear =
+      String(normalizeDateString(row[3]) || coverage.to).slice(0, 4);
+    const yearStorage = storageForYear(issueYear);
     const fileId = extractDriveFileIdFromNotes_(row[8]);
-    let fileInfo = fileId ? files.byId[fileId] : null;
+    let file = null;
 
-    if (!fileInfo) {
-      const matches = files.byName[String(row[7] || '').trim()] || [];
-      if (matches.length === 1) fileInfo = matches[0];
-      if (matches.length > 1) {
-        warnings.push('Ambiguous physical PDF filename: ' + String(row[7] || ''));
+    if (fileId) {
+      try {
+        file = DriveApp.getFileById(fileId);
+      } catch (error) {
+        warnings.push('Registered PDF is not accessible: ' + fileId);
       }
+    } else {
+      file = findLegacyPhysicalFile_(String(row[7] || '').trim(), yearStorage);
     }
 
-    if (!fileInfo) return;
+    if (!file) return;
+
+    const fileInfo = physicalFileInfo_(file, yearStorage);
+
+    // Staging/other locations are never used to justify archiving evidence.
+    if (
+      fileInfo.storage !== 'ACTIVE' &&
+      fileInfo.storage !== 'ARCHIVED_REDUNDANT'
+    ) {
+      warnings.push('PDF outside managed active/archive folders: ' + fileInfo.name);
+      return;
+    }
 
     intervals.push({
       from: coverage.from,
       to: coverage.to,
       fileInfo: fileInfo,
+      yearStorage: yearStorage,
       documentRow: index + 2
     });
   });
@@ -6846,11 +6948,11 @@ function optimizeOfficialPdfCoverage_(documentSheet) {
     const selected = !!plan.selected[interval.fileInfo.id];
 
     if (selected && interval.fileInfo.storage !== 'ACTIVE') {
-      interval.fileInfo.file.moveTo(activeFolder);
+      interval.fileInfo.file.moveTo(interval.yearStorage.active);
       movedToActive.push(interval.fileInfo.name);
       interval.fileInfo.storage = 'ACTIVE';
     } else if (!selected && interval.fileInfo.storage === 'ACTIVE') {
-      interval.fileInfo.file.moveTo(archiveFolder);
+      interval.fileInfo.file.moveTo(interval.yearStorage.archive);
       movedToArchive.push(interval.fileInfo.name);
       interval.fileInfo.storage = 'ARCHIVED_REDUNDANT';
     }
@@ -6957,7 +7059,7 @@ function confirmOfficialImportUncached_(payload) {
     SpreadsheetApp.flush();
 
     // Move the exact uploaded original out of staging only after Master writes succeed.
-    staged.file.moveTo(DriveApp.getFolderById(CONFIG.OFFICIAL_ACTIVE_FOLDER_ID));
+    staged.file.moveTo(staged.storage.active);
 
     updateDocumentRegisterStorage_(
       documentSheet,
