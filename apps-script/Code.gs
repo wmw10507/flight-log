@@ -5994,9 +5994,12 @@ function compareOfficialMasterRow_(masterRow, official) {
     ['L/D', masterRow[MASTER_COL.LANDING - 1], official.landing, normalizeYesNoBlank]
   ];
 
-  if (String(official.autoland || '').trim()) {
-    checks.push(['A/L', masterRow[MASTER_COL.AUTOLAND - 1], official.autoland, normalizeYesNoBlank]);
-  }
+  checks.push([
+    'A/L',
+    masterRow[MASTER_COL.AUTOLAND - 1],
+    official.autoland,
+    normalizeYesNoBlank
+  ]);
 
   const changes = [];
 
@@ -6574,9 +6577,8 @@ function applyOfficialToExistingRow_(sheet, item, sourceId) {
   sheet.getRange(row, MASTER_COL.TAKEOFF).setValue(official.takeoff);
   sheet.getRange(row, MASTER_COL.LANDING).setValue(official.landing);
 
-  if (official.autoland !== '') {
-    sheet.getRange(row, MASTER_COL.AUTOLAND).setValue(official.autoland);
-  }
+  // Blank is a real source value here (e.g. KE164). Do not infer N.
+  sheet.getRange(row, MASTER_COL.AUTOLAND).setValue(official.autoland);
 
   // Derived company log columns. User-owned overrides live elsewhere.
   sheet.getRange(row, MASTER_COL.DAY).setFormula('=MAX(0,S' + row + '-U' + row + ')');
