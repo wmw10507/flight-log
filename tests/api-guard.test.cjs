@@ -5,7 +5,7 @@ const path = require("node:path");
 const vm = require("node:vm");
 const ts = require("typescript");
 
-function loadRoute(relative, enabled) {
+function loadRoute(relative, enabled, pdfMock) {
   const calls = [];
   const source = fs.readFileSync(path.join(__dirname, "..", relative), "utf8");
   const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
@@ -18,11 +18,13 @@ function loadRoute(relative, enabled) {
     },
     require(name) {
       if (name === "next/server") return { NextResponse: Response };
-      if (name === "unpdf") return {
+      if (name === "unpdf") return pdfMock || {
         getDocumentProxy() { throw new Error("Disabled Confirm must not parse a PDF"); },
         extractText() { throw new Error("Unexpected extraction"); },
       };
-      if (name === "@/lib/official-flight-log") return {};
+      if (name === "@/lib/official-flight-log") return pdfMock ? {
+        parseKoreanAirFlightLogText: () => ({records: [{date: "2026-10-06"}], warnings: [], coverageFrom: "2026-10-06", coverageTo: "2026-10-06"}),
+      } : {};
       return require(name);
     },
   });
@@ -37,6 +39,28 @@ test("Flight bridge rejects official and unknown actions without contacting Apps
     assert.equal(response.status, 403);
   }
   assert.equal(route.calls.length, 0);
+});
+
+test("Confirm retains exact original PDF bytes when PDF.js transfers its input", async () => {
+  const original = Buffer.from("%PDF-original-report-bytes");
+  let transferred = false;
+  const route = loadRoute("app/api/official-import/route.ts", "true", {
+    async getDocumentProxy(bytes) {
+      structuredClone(bytes, {transfer: [bytes.buffer]});
+      transferred = bytes.byteLength === 0;
+      return {numPages: 1, getMetadata: async () => ({info: {CreationDate: "D:20261014052303Z"}}), loadingTask: {destroy: async () => {}}};
+    },
+    extractText: async () => ({text: "Flight Log Report", totalPages: 1}),
+  });
+  const form = new FormData();
+  form.set("mode", "confirm");
+  form.set("file", new File([original], "report.pdf", {type: "application/pdf"}));
+  const response = await route.post({formData: async () => form});
+  assert.equal(response.status, 200);
+  assert.equal(transferred, true);
+  const payload = JSON.parse(route.calls[0].options.body).payload;
+  assert.deepEqual(Buffer.from(payload.pdfBase64, "base64"), original);
+  assert.equal(require("node:crypto").createHash("sha256").update(Buffer.from(payload.pdfBase64, "base64")).digest("hex"), payload.source.sha256);
 });
 
 test("Existing app actions still forward, using only the server API key", async () => {
