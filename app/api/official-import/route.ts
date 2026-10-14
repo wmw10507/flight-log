@@ -90,10 +90,7 @@ async function extractPdf(file: File) {
       ),
     ]);
 
-    const text =
-      typeof extraction.text === "string"
-        ? extraction.text
-        : extraction.text.join("\n");
+    const text = extraction.text;
 
     if (!/Flight\s+Log\s+Report/i.test(text)) {
       throw new Error(
@@ -113,7 +110,7 @@ async function extractPdf(file: File) {
       ...parsed,
     };
   } finally {
-    await pdf.destroy();
+    await pdf.loadingTask.destroy();
   }
 }
 
