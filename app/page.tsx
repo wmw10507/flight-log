@@ -1310,7 +1310,7 @@ export default function Home() {
             NAV
         ================================================== */}
 
-        <nav aria-label="Main navigation" className="mt-7 flex gap-5 border-b border-[var(--line)] sm:gap-7">
+        <nav aria-label="Main navigation" className="mt-7 flex gap-5 overflow-x-auto border-b border-[var(--line)] sm:gap-7">
 
           <TopTab
             active={
