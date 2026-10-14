@@ -35,7 +35,13 @@ const CONFIG = {
   RECENCY_DAYS: 90,
   RECENCY_REQUIRED: 3,
 
-  STANDARD_TYPE_32S: 'A321-272NX'
+  STANDARD_TYPE_32S: 'A321-272NX',
+
+  DOCUMENT_REGISTER_SHEET: 'DOCUMENT_REGISTER',
+  OFFICIAL_IMPORT_SHEET: 'OFFICIAL_IMPORT',
+  OFFICIAL_ACTIVE_FOLDER_ID: '1OQugjwi7EzDBSW7buKq5nTeCqaDc-NRV',
+  OFFICIAL_ARCHIVE_FOLDER_ID: '1xF1T42rnNwNzlxIm_gizTauj_42YHaua',
+  OFFICIAL_STAGING_FOLDER_NAME: 'Import_Staging'
 };
 
 
@@ -4858,6 +4864,20 @@ function doPost(e) {
       });
     }
 
+    if (action === 'previewOfficialImport') {
+      return jsonResponse_({
+        ok: true,
+        data: previewOfficialImport(payload)
+      });
+    }
+
+    if (action === 'confirmOfficialImport') {
+      return jsonResponse_({
+        ok: true,
+        data: confirmOfficialImport(payload)
+      });
+    }
+
 
     throw new Error(
       'Unknown action: ' + action
@@ -5575,7 +5595,7 @@ function getCaptains() {
 
 
 /* v0.2.6: caches never supply write/identity decisions. */
-const BACKEND_VERSION = '0.2.8';
+const BACKEND_VERSION = '0.3.0-import-v1';
 const flightExecution_ = { spreadsheets: {}, masterIndex: null };
 
 function openFlightSpreadsheet_(id) {
@@ -5783,4 +5803,1228 @@ function readMasterRows_(sheet, lastRow, width, selection) {
     return currentLastRow >= 2 ? sheet.getRange(2, 1, currentLastRow - 1, width).getDisplayValues() : [];
   }
   return rows;
+}
+
+
+/* =========================================================
+   OFFICIAL PDF IMPORT v1
+   ---------------------------------------------------------
+   Safety model:
+   - Preview is read-only.
+   - Confirm re-runs preview under ScriptLock.
+   - Existing OFFICIAL rows with changed official-source values
+     are MISMATCH and are NOT auto-overwritten.
+   - User-owned post-flight fields are never touched here.
+   - Source PDF is staged first, then retained in Drive.
+   - No source PDF is deleted; redundant reports move to archive.
+========================================================= */
+
+function previewOfficialImport(payload) {
+  return buildOfficialImportPreview_(payload);
+}
+
+
+function confirmOfficialImport(payload) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+
+  try {
+    return withFlightMutation_(function() {
+      return confirmOfficialImportUncached_(payload);
+    });
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+function validateOfficialImportPayload_(payload, requirePdf) {
+  if (!payload || !payload.source || !Array.isArray(payload.records)) {
+    throw new Error('Official import payload is incomplete.');
+  }
+
+  const source = payload.source;
+  const sha256 = String(source.sha256 || '').trim().toLowerCase();
+
+  if (!/^[a-f0-9]{64}$/.test(sha256)) {
+    throw new Error('Official PDF SHA-256 is missing or invalid.');
+  }
+
+  if (!payload.records.length || payload.records.length > 1000) {
+    throw new Error('Official import record count is invalid.');
+  }
+
+  const coverageFrom = normalizeDateString(source.coverageFrom);
+  const coverageTo = normalizeDateString(source.coverageTo);
+
+  if (!coverageFrom || !coverageTo || coverageFrom > coverageTo) {
+    throw new Error('Official PDF coverage is invalid.');
+  }
+
+  if (requirePdf) {
+    const pdfBase64 = String(payload.pdfBase64 || '');
+    if (!pdfBase64) throw new Error('Original PDF bytes are missing.');
+    if (pdfBase64.length > 8 * 1024 * 1024) {
+      throw new Error('Original PDF payload is too large.');
+    }
+  }
+
+  payload.records.forEach(function(record, index) {
+    const date = normalizeDateString(record && record.date);
+    const flight = normalizeFlightNo(record && record.flight);
+    const dep = String(record && record.dep || '').trim().toUpperCase();
+    const arr = String(record && record.arr || '').trim().toUpperCase();
+
+    if (!date || !flight || !dep || !arr) {
+      throw new Error('Official record key is incomplete at index ' + index + '.');
+    }
+  });
+
+  return {
+    fileName: String(source.fileName || 'Flight Log Report.pdf').trim(),
+    mimeType: 'application/pdf',
+    fileSize: Number(source.fileSize || 0),
+    sha256: sha256,
+    totalPages: Number(source.totalPages || 0),
+    coverageFrom: coverageFrom,
+    coverageTo: coverageTo,
+    sectorCount: Number(source.sectorCount || payload.records.length)
+  };
+}
+
+
+function officialImportSourceId_(source) {
+  return 'SRC-KAL-FLIGHTLOG-' +
+    String(source.coverageTo || '').replace(/-/g, '') +
+    '-' +
+    String(source.sha256 || '').slice(0, 8).toUpperCase();
+}
+
+
+function normalizeClock_(value) {
+  const match = String(value || '').trim().match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) return String(value || '').trim();
+  return String(Number(match[1])).padStart(2, '0') + ':' + match[2];
+}
+
+
+function normalizeDuration_(value) {
+  const match = String(value || '').trim().match(/^(\d+):(\d{2})$/);
+  if (!match) return String(value || '').trim();
+  return String(Number(match[1])) + ':' + match[2];
+}
+
+
+function durationMinutes_(value) {
+  const match = String(value || '').trim().match(/^(\d+):(\d{2})$/);
+  if (!match) return null;
+  return Number(match[1]) * 60 + Number(match[2]);
+}
+
+
+function durationFraction_(value) {
+  const minutes = durationMinutes_(value);
+  return minutes === null ? '' : minutes / (24 * 60);
+}
+
+
+function officialFieldSummary_(record) {
+  return [
+    record.registration || '',
+    record.dutyCode || '',
+    normalizeClock_(record.outGmt),
+    normalizeClock_(record.inGmt),
+    'BT ' + normalizeDuration_(record.block),
+    'Company ' + normalizeDuration_(record.companyTime),
+    'MOLIT ' + normalizeDuration_(record.molitTime),
+    'Night ' + normalizeDuration_(record.night),
+    'INST ' + normalizeDuration_(record.inst),
+    'T/O ' + normalizeYesNoBlank(record.takeoff),
+    'L/D ' + normalizeYesNoBlank(record.landing),
+    record.autoland ? 'A/L ' + normalizeYesNoBlank(record.autoland) : ''
+  ].filter(Boolean).join(' | ');
+}
+
+
+function compareOfficialMasterRow_(masterRow, official) {
+  const checks = [
+    ['Registration', masterRow[MASTER_COL.REG - 1], official.registration, function(v) { return String(v || '').trim().toUpperCase(); }],
+    ['Duty', masterRow[MASTER_COL.DUTY - 1], official.dutyCode, function(v) { return String(v || '').trim().toUpperCase(); }],
+    ['OUT', masterRow[MASTER_COL.OUT_GMT - 1], official.outGmt, normalizeClock_],
+    ['IN', masterRow[MASTER_COL.IN_GMT - 1], official.inGmt, normalizeClock_],
+    ['Block', masterRow[MASTER_COL.BLOCK - 1], official.block, normalizeDuration_],
+    ['Company', masterRow[MASTER_COL.COMPANY - 1], official.companyTime, normalizeDuration_],
+    ['MOLIT', masterRow[MASTER_COL.MOLIT - 1], official.molitTime, normalizeDuration_],
+    ['Night', masterRow[MASTER_COL.NIGHT - 1], official.night, normalizeDuration_],
+    ['INST', masterRow[MASTER_COL.INST - 1], official.inst, normalizeDuration_],
+    ['T/O', masterRow[MASTER_COL.TAKEOFF - 1], official.takeoff, normalizeYesNoBlank],
+    ['L/D', masterRow[MASTER_COL.LANDING - 1], official.landing, normalizeYesNoBlank]
+  ];
+
+  if (String(official.autoland || '').trim()) {
+    checks.push(['A/L', masterRow[MASTER_COL.AUTOLAND - 1], official.autoland, normalizeYesNoBlank]);
+  }
+
+  const changes = [];
+
+  checks.forEach(function(check) {
+    const name = check[0];
+    const normalizer = check[3];
+    const before = normalizer(check[1]);
+    const after = normalizer(check[2]);
+
+    if (after !== '' && before !== after) {
+      changes.push({
+        field: name,
+        before: before,
+        after: after
+      });
+    }
+  });
+
+  return changes;
+}
+
+
+function officialQueueCandidates_(queueRows, official) {
+  const flight = normalizeFlightNo(official.flight);
+  const dep = String(official.dep || '').trim().toUpperCase();
+  const arr = String(official.arr || '').trim().toUpperCase();
+  const date = normalizeDateString(official.date);
+
+  return queueRows.map(function(row, index) {
+    return { row: row, sheetRow: index + 2 };
+  }).filter(function(item) {
+    const row = item.row;
+    const queueDate = normalizeDateString(row[QUEUE_COL.DATE - 1]);
+
+    return normalizeFlightNo(row[QUEUE_COL.FLIGHT - 1]) === flight &&
+      String(row[QUEUE_COL.DEP - 1] || '').trim().toUpperCase() === dep &&
+      String(row[QUEUE_COL.ARR - 1] || '').trim().toUpperCase() === arr &&
+      (queueDate === date || adjacentCalendarDate(queueDate, date));
+  });
+}
+
+
+function dateTimeClockMinutes_(value) {
+  const match = String(value || '').match(/(\d{1,2}):(\d{2})(?::\d{2})?\s*$/);
+  if (!match) return null;
+  return Number(match[1]) * 60 + Number(match[2]);
+}
+
+
+function officialKstClockMinutes_(gmt) {
+  const match = String(gmt || '').trim().match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) return null;
+  return (Number(match[1]) * 60 + Number(match[2]) + 9 * 60) % (24 * 60);
+}
+
+
+function circularMinuteDistance_(a, b) {
+  if (a === null || b === null) return 99999;
+  const raw = Math.abs(a - b);
+  return Math.min(raw, 1440 - raw);
+}
+
+
+function findQueueForOfficial_(queueRows, official) {
+  const candidates = officialQueueCandidates_(queueRows, official);
+
+  if (!candidates.length) {
+    return { match: null, ambiguous: false };
+  }
+
+  const exact = candidates.filter(function(item) {
+    return normalizeDateString(item.row[QUEUE_COL.DATE - 1]) === normalizeDateString(official.date);
+  });
+
+  if (exact.length === 1) return { match: exact[0], ambiguous: false };
+  if (candidates.length === 1) return { match: candidates[0], ambiguous: false };
+
+  const officialClock = officialKstClockMinutes_(official.outGmt);
+
+  const ranked = candidates.map(function(item) {
+    const row = item.row;
+    const queueClock = dateTimeClockMinutes_(
+      row[QUEUE_COL.LATEST_OUT - 1] || row[QUEUE_COL.ORIGINAL_OUT - 1]
+    );
+
+    return {
+      item: item,
+      distance: circularMinuteDistance_(officialClock, queueClock)
+    };
+  }).sort(function(a, b) {
+    return a.distance - b.distance;
+  });
+
+  if (
+    ranked.length &&
+    ranked[0].distance <= 180 &&
+    (ranked.length === 1 || ranked[1].distance - ranked[0].distance >= 30)
+  ) {
+    return { match: ranked[0].item, ambiguous: false };
+  }
+
+  return {
+    match: null,
+    ambiguous: true,
+    reason: 'Multiple Queue rows match this official sector.'
+  };
+}
+
+
+function findMasterForOfficial_(masterRows, official, queueMatch) {
+  const candidatesByLogId = function(logId) {
+    if (!logId) return [];
+    return masterRows.map(function(row, index) {
+      return { row: row, sheetRow: index + 2 };
+    }).filter(function(item) {
+      return String(item.row[MASTER_COL.LOG_ID - 1] || '').trim() === String(logId).trim();
+    });
+  };
+
+  if (queueMatch && queueMatch.row) {
+    const linkedId = String(queueMatch.row[QUEUE_COL.MASTER_LOG_ID - 1] || '').trim();
+    if (linkedId) {
+      const linked = candidatesByLogId(linkedId);
+      if (linked.length === 1) return { match: linked[0], ambiguous: false };
+      return {
+        match: null,
+        ambiguous: true,
+        reason: linked.length ? 'Queue Master Log ID is duplicated.' : 'Queue Master Log ID does not exist in Master.'
+      };
+    }
+
+    const eventId = String(queueMatch.row[QUEUE_COL.EVENT_ID - 1] || '').trim();
+    if (eventId) {
+      const eventMatches = masterRows.map(function(row, index) {
+        return { row: row, sheetRow: index + 2 };
+      }).filter(function(item) {
+        return String(item.row[MASTER_COL.EVENT_ID - 1] || '').trim() === eventId;
+      });
+
+      if (eventMatches.length === 1) return { match: eventMatches[0], ambiguous: false };
+      if (eventMatches.length > 1) {
+        return { match: null, ambiguous: true, reason: 'Calendar Event ID is duplicated in Master.' };
+      }
+    }
+  }
+
+  const date = normalizeDateString(official.date);
+  const flight = normalizeFlightNo(official.flight);
+  const dep = String(official.dep || '').trim().toUpperCase();
+  const arr = String(official.arr || '').trim().toUpperCase();
+
+  const tupleCandidates = masterRows.map(function(row, index) {
+    return { row: row, sheetRow: index + 2 };
+  }).filter(function(item) {
+    const row = item.row;
+    return normalizeFlightNo(row[MASTER_COL.FLIGHT - 1]) === flight &&
+      String(row[MASTER_COL.DEP - 1] || '').trim().toUpperCase() === dep &&
+      String(row[MASTER_COL.ARR - 1] || '').trim().toUpperCase() === arr;
+  });
+
+  const exact = tupleCandidates.filter(function(item) {
+    return normalizeDateString(item.row[MASTER_COL.DATE - 1]) === date;
+  });
+
+  if (exact.length === 1) return { match: exact[0], ambiguous: false };
+  if (exact.length > 1) return { match: null, ambiguous: true, reason: 'Exact Master key is duplicated.' };
+
+  const adjacent = tupleCandidates.filter(function(item) {
+    return adjacentCalendarDate(item.row[MASTER_COL.DATE - 1], date);
+  });
+
+  if (adjacent.length === 1) return { match: adjacent[0], ambiguous: false };
+  if (adjacent.length > 1) return { match: null, ambiguous: true, reason: 'Multiple adjacent-date Master rows match.' };
+
+  return { match: null, ambiguous: false };
+}
+
+
+function findOfficialRegisterSource_(documentRows, source) {
+  const coverage = source.coverageFrom + ' to ' + source.coverageTo;
+  const hashTag = 'SHA256=' + source.sha256.toLowerCase();
+
+  let filenameCoverage = null;
+
+  for (let i = 0; i < documentRows.length; i++) {
+    const row = documentRows[i];
+    const notes = String(row[8] || '');
+    const sourceId = String(row[0] || '');
+
+    if (notes.toLowerCase().indexOf(hashTag.toLowerCase()) >= 0) {
+      return { row: i + 2, sourceId: sourceId, exactHash: true };
+    }
+
+    if (
+      String(row[1] || '').trim() === 'Flight Log Report' &&
+      String(row[7] || '').trim() === source.fileName &&
+      String(row[4] || '').trim() === coverage
+    ) {
+      filenameCoverage = { row: i + 2, sourceId: sourceId, exactHash: false };
+    }
+  }
+
+  return filenameCoverage;
+}
+
+
+function buildOfficialImportPreview_(payload) {
+  const source = validateOfficialImportPayload_(payload, false);
+  const ss = openFlightSpreadsheet_(CONFIG.SPREADSHEET_ID);
+  const masterSheet = ss.getSheetByName(CONFIG.MASTER_SHEET);
+  const queueSheet = ss.getSheetByName(CONFIG.QUEUE_SHEET);
+  const documentSheet = ss.getSheetByName(CONFIG.DOCUMENT_REGISTER_SHEET);
+
+  if (!masterSheet || !queueSheet || !documentSheet) {
+    throw new Error('Required Flight LOG sheets are missing.');
+  }
+
+  const masterRows = masterSheet.getLastRow() >= 2
+    ? masterSheet.getRange(2, 1, masterSheet.getLastRow() - 1, 70).getDisplayValues()
+    : [];
+
+  const queueRows = queueSheet.getLastRow() >= 2
+    ? queueSheet.getRange(2, 1, queueSheet.getLastRow() - 1, 14).getDisplayValues()
+    : [];
+
+  const documentRows = documentSheet.getLastRow() >= 2
+    ? documentSheet.getRange(2, 1, documentSheet.getLastRow() - 1, 9).getDisplayValues()
+    : [];
+
+  const items = [];
+  const counts = {
+    ALREADY_OFFICIAL: 0,
+    MATCHED_PROVISIONAL: 0,
+    NEW: 0,
+    MISMATCH: 0,
+    EXCLUDED: 0
+  };
+
+  payload.records.forEach(function(record, index) {
+    const official = {
+      date: normalizeDateString(record.date),
+      registration: String(record.registration || '').trim().toUpperCase(),
+      aircraftType: String(record.aircraftType || '').trim().toUpperCase(),
+      flight: normalizeFlightNo(record.flight),
+      dep: String(record.dep || '').trim().toUpperCase(),
+      arr: String(record.arr || '').trim().toUpperCase(),
+      dutyCode: String(record.dutyCode || '').trim().toUpperCase(),
+      outGmt: normalizeClock_(record.outGmt),
+      inGmt: normalizeClock_(record.inGmt),
+      block: normalizeDuration_(record.block),
+      companyTime: normalizeDuration_(record.companyTime),
+      molitTime: normalizeDuration_(record.molitTime),
+      night: normalizeDuration_(record.night),
+      inst: normalizeDuration_(record.inst),
+      takeoff: normalizeYesNoBlank(record.takeoff),
+      landing: normalizeYesNoBlank(record.landing),
+      autoland: normalizeYesNoBlank(record.autoland)
+    };
+
+    const queueResult = findQueueForOfficial_(queueRows, official);
+    const queueMatch = queueResult.match;
+    const masterResult = findMasterForOfficial_(masterRows, official, queueMatch);
+    const masterMatch = masterResult.match;
+
+    const queueStatus = queueMatch
+      ? String(queueMatch.row[QUEUE_COL.STATUS - 1] || '').toUpperCase()
+      : '';
+
+    const excluded =
+      official.dutyCode === 'EX' ||
+      queueStatus.indexOf('DEADHEAD') >= 0 ||
+      queueStatus.indexOf('TRAVEL') >= 0;
+
+    let status;
+    let reason = '';
+    let changes = [];
+
+    if (queueResult.ambiguous || masterResult.ambiguous) {
+      status = 'MISMATCH';
+      reason = queueResult.reason || masterResult.reason || 'Ambiguous identity.';
+    } else if (excluded) {
+      status = 'EXCLUDED';
+      reason = 'Deadhead/travel evidence is not credited as an operating Master sector.';
+    } else if (!masterMatch) {
+      status = 'NEW';
+      reason = queueMatch
+        ? 'Official sector has Queue evidence but no Master row.'
+        : 'Official sector is not present in Master.';
+    } else {
+      const masterRow = masterMatch.row;
+      const recordStatus = String(masterRow[MASTER_COL.RECORD_STATUS - 1] || '').toUpperCase();
+      changes = compareOfficialMasterRow_(masterRow, official);
+
+      if (recordStatus.indexOf('OFFICIAL') >= 0) {
+        if (changes.length) {
+          status = 'MISMATCH';
+          reason = 'Existing OFFICIAL values differ from this PDF. Manual review required.';
+        } else {
+          status = 'ALREADY_OFFICIAL';
+          reason = 'Existing official Master values match.';
+        }
+      } else {
+        status = 'MATCHED_PROVISIONAL';
+        reason = 'Existing provisional Master row can be officialized.';
+      }
+    }
+
+    counts[status]++;
+
+    const queueCrew = queueMatch ? parseCrewMemo(queueMatch.row[QUEUE_COL.MEMO - 1] || '') : null;
+    const safetyPilot = masterMatch
+      ? normalizeYesNoBlank(masterMatch.row[MASTER_COL.SAFETY - 1]) === 'Y'
+      : !!(queueCrew && queueCrew.safetyPilot);
+
+    items.push({
+      index: index,
+      status: status,
+      reason: reason,
+      record: official,
+      changes: changes,
+      queueRow: queueMatch ? queueMatch.sheetRow : null,
+      queueDate: queueMatch ? normalizeDateString(queueMatch.row[QUEUE_COL.DATE - 1]) : '',
+      queueEventId: queueMatch ? String(queueMatch.row[QUEUE_COL.EVENT_ID - 1] || '') : '',
+      queueMasterLogId: queueMatch ? String(queueMatch.row[QUEUE_COL.MASTER_LOG_ID - 1] || '') : '',
+      masterRow: masterMatch ? masterMatch.sheetRow : null,
+      masterLogId: masterMatch ? String(masterMatch.row[MASTER_COL.LOG_ID - 1] || '') : '',
+      masterDate: masterMatch ? normalizeDateString(masterMatch.row[MASTER_COL.DATE - 1]) : '',
+      safetyPilot: safetyPilot
+    });
+  });
+
+  const existingSource = findOfficialRegisterSource_(documentRows, source);
+  const actionable = counts.MATCHED_PROVISIONAL + counts.NEW;
+  const alreadyImported = !!existingSource && actionable === 0 && counts.MISMATCH === 0;
+
+  return {
+    source: source,
+    sourceId: officialImportSourceId_(source),
+    sourcePreviouslyRegistered: !!existingSource,
+    registeredSourceId: existingSource ? existingSource.sourceId : '',
+    alreadyImported: alreadyImported,
+    counts: counts,
+    hasMismatches: counts.MISMATCH > 0,
+    canConfirm: counts.MISMATCH === 0,
+    items: items
+  };
+}
+
+
+function createOfficialImportBackup_() {
+  const sourceFile = DriveApp.getFileById(CONFIG.SPREADSHEET_ID);
+  const parents = sourceFile.getParents();
+  const destination = parents.hasNext() ? parents.next() : DriveApp.getRootFolder();
+  const stamp = Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'yyyy-MM-dd_HHmmss');
+  const copy = sourceFile.makeCopy(
+    'Myungwoo Flight LOG — MASTER_backup_before_official_import_' + stamp,
+    destination
+  );
+
+  return {
+    id: copy.getId(),
+    url: copy.getUrl(),
+    name: copy.getName()
+  };
+}
+
+
+function ensureOfficialStagingFolder_() {
+  const active = DriveApp.getFolderById(CONFIG.OFFICIAL_ACTIVE_FOLDER_ID);
+  const folders = active.getFoldersByName(CONFIG.OFFICIAL_STAGING_FOLDER_NAME);
+  return folders.hasNext()
+    ? folders.next()
+    : active.createFolder(CONFIG.OFFICIAL_STAGING_FOLDER_NAME);
+}
+
+
+function createStagedOfficialPdf_(source, base64) {
+  const staging = ensureOfficialStagingFolder_();
+  const bytes = Utilities.base64Decode(String(base64 || ''));
+  const blob = Utilities.newBlob(bytes, 'application/pdf', source.fileName);
+  const file = staging.createFile(blob);
+
+  return {
+    id: file.getId(),
+    url: file.getUrl(),
+    file: file
+  };
+}
+
+
+function officialImportNotes_(source, fileInfo, storage, extra) {
+  return [
+    source.sectorCount + ' source records.',
+    'SHA256=' + source.sha256,
+    'DriveFileId=' + (fileInfo && fileInfo.id ? fileInfo.id : ''),
+    'URL=' + (fileInfo && fileInfo.url ? fileInfo.url : ''),
+    'Storage=' + storage,
+    extra || ''
+  ].filter(Boolean).join(' ');
+}
+
+
+function appendDocumentRegister_(sheet, sourceId, source, fileInfo, status, notesExtra) {
+  const row = [
+    sourceId,
+    'Flight Log Report',
+    'Korean Air (source report)',
+    source.coverageTo,
+    source.coverageFrom + ' to ' + source.coverageTo,
+    'Detailed airline sector record',
+    status,
+    source.fileName,
+    officialImportNotes_(source, fileInfo, status, notesExtra)
+  ];
+
+  sheet.appendRow(row);
+  return sheet.getLastRow();
+}
+
+
+function updateDocumentRegisterStorage_(sheet, rowNumber, source, fileInfo, storage, extra) {
+  const note = officialImportNotes_(source, fileInfo, storage, extra);
+  sheet.getRange(rowNumber, 7).setValue(storage === 'FAILED' ? 'IMPORT FAILED' : 'SOURCE PROVIDED');
+  sheet.getRange(rowNumber, 9).setValue(note);
+}
+
+
+function setDurationCell_(sheet, row, col, value) {
+  const fraction = durationFraction_(value);
+  if (fraction === '') return;
+  sheet.getRange(row, col).setValue(fraction);
+}
+
+
+function appendRemark_(sheet, row, note) {
+  const cell = sheet.getRange(row, MASTER_COL.REMARKS);
+  const oldValue = String(cell.getDisplayValue() || '').trim();
+  cell.setValue(oldValue ? oldValue + ' | ' + note : note);
+}
+
+
+function applyOfficialToExistingRow_(sheet, item, sourceId) {
+  const row = item.masterRow;
+  const official = item.record;
+
+  sheet.getRange(row, MASTER_COL.REG).setValue(official.registration);
+  sheet.getRange(row, MASTER_COL.DUTY).setValue(official.dutyCode);
+  sheet.getRange(row, MASTER_COL.OUT_GMT).setValue(official.outGmt);
+  sheet.getRange(row, MASTER_COL.IN_GMT).setValue(official.inGmt);
+
+  setDurationCell_(sheet, row, MASTER_COL.BLOCK, official.block);
+  setDurationCell_(sheet, row, MASTER_COL.COMPANY, official.companyTime);
+  setDurationCell_(sheet, row, MASTER_COL.MOLIT, official.molitTime);
+  setDurationCell_(sheet, row, MASTER_COL.NIGHT, official.night);
+  setDurationCell_(sheet, row, MASTER_COL.INST, official.inst);
+
+  sheet.getRange(row, MASTER_COL.TAKEOFF).setValue(official.takeoff);
+  sheet.getRange(row, MASTER_COL.LANDING).setValue(official.landing);
+
+  if (official.autoland !== '') {
+    sheet.getRange(row, MASTER_COL.AUTOLAND).setValue(official.autoland);
+  }
+
+  // Derived company log columns. User-owned overrides live elsewhere.
+  sheet.getRange(row, MASTER_COL.DAY).setFormula('=MAX(0,S' + row + '-U' + row + ')');
+  sheet.getRange(row, MASTER_COL.IFR).setFormula('=V' + row);
+  sheet.getRange(row, MASTER_COL.PFPM).setFormula(
+    '=IF(AS' + row + '<>"",AS' + row + ',IF(AND(Z' + row + '="Y",AA' + row + '="Y"),"PF","PM"))'
+  );
+  sheet.getRange(row, MASTER_COL.SIC).setFormula('=S' + row);
+
+  if (item.safetyPilot) {
+    sheet.getRange(row, MASTER_COL.SAFETY_CREDIT).setFormula('=S' + row);
+  } else {
+    sheet.getRange(row, MASTER_COL.SAFETY_CREDIT).setValue(0);
+  }
+
+  sheet.getRange(row, MASTER_COL.VERIFICATION).setValue('SOURCE IMPORTED');
+  sheet.getRange(row, MASTER_COL.SOURCE_ID).setValue(sourceId);
+  sheet.getRange(row, MASTER_COL.BT_SOURCE).setValue('Flight Log Report');
+  sheet.getRange(row, MASTER_COL.RECORD_STATUS).setValue('OFFICIAL CONFIRMED');
+  sheet.getRange(row, MASTER_COL.CREDIT_BASIS).setValue(
+    durationMinutes_(official.molitTime) !== durationMinutes_(official.block)
+      ? 'MOLIT / Authority Credited Time (partial crew credit)'
+      : 'MOLIT / Authority Credited Time'
+  );
+
+  appendRemark_(
+    sheet,
+    row,
+    'Official PDF import reconciled; user-entered Approach/PF-PM override/Flight Comment preserved.'
+  );
+
+  const syncCell = sheet.getRange(row, MASTER_COL.SYNC_NOTE);
+  const oldSync = String(syncCell.getDisplayValue() || '').trim();
+  const sync = 'Official PDF Import ' + sourceId + ' completed.';
+  syncCell.setValue(oldSync ? oldSync + ' | ' + sync : sync);
+
+  return String(sheet.getRange(row, MASTER_COL.LOG_ID).getDisplayValue() || '');
+}
+
+
+function buildOfficialNewMasterRow_(sheetRow, item, sourceId, queueRows) {
+  const official = item.record;
+  const row = new Array(70).fill('');
+  const queue = item.queueRow ? queueRows[item.queueRow - 2] : null;
+  const crew = queue ? parseCrewMemo(queue[QUEUE_COL.MEMO - 1] || '') : null;
+  const safety = !!(crew && crew.safetyPilot);
+  const logId = makeLogId(official.date, official.flight, official.dep, official.arr);
+
+  setArrayCol(row, MASTER_COL.LOG_ID, logId);
+  setArrayCol(row, MASTER_COL.DATE, official.date);
+  setArrayCol(row, MASTER_COL.FLIGHT, official.flight);
+  setArrayCol(row, MASTER_COL.DEP, official.dep);
+  setArrayCol(row, MASTER_COL.ARR, official.arr);
+  setArrayCol(row, MASTER_COL.ROUTE, official.dep + '-' + official.arr);
+
+  setArrayCol(row, MASTER_COL.REG, official.registration);
+  setArrayCol(row, MASTER_COL.DUTY, official.dutyCode);
+  setArrayCol(row, MASTER_COL.POSITION, crew && crew.role ? crew.role : 'FO');
+  setArrayCol(row, MASTER_COL.PIC, crew && crew.pic ? crew.pic : '');
+
+  setArrayCol(row, MASTER_COL.OUT_GMT, official.outGmt);
+  setArrayCol(row, MASTER_COL.IN_GMT, official.inGmt);
+  setArrayCol(row, MASTER_COL.BLOCK, durationFraction_(official.block));
+  setArrayCol(row, MASTER_COL.COMPANY, durationFraction_(official.companyTime));
+  setArrayCol(row, MASTER_COL.MOLIT, durationFraction_(official.molitTime));
+  setArrayCol(row, MASTER_COL.DAY, '=MAX(0,S' + sheetRow + '-U' + sheetRow + ')');
+  setArrayCol(row, MASTER_COL.NIGHT, durationFraction_(official.night));
+  setArrayCol(row, MASTER_COL.INST, durationFraction_(official.inst));
+  setArrayCol(row, MASTER_COL.IFR, '=V' + sheetRow);
+
+  setArrayCol(row, MASTER_COL.TAKEOFF, official.takeoff);
+  setArrayCol(row, MASTER_COL.LANDING, official.landing);
+  setArrayCol(row, MASTER_COL.AUTOLAND, official.autoland);
+  setArrayCol(
+    row,
+    MASTER_COL.PFPM,
+    '=IF(AS' + sheetRow + '<>"",AS' + sheetRow + ',IF(AND(Z' + sheetRow + '="Y",AA' + sheetRow + '="Y"),"PF","PM"))'
+  );
+
+  setArrayCol(row, MASTER_COL.SIC, '=S' + sheetRow);
+  setArrayCol(row, MASTER_COL.SAFETY, safety ? 'Y' : 'N');
+  setArrayCol(row, MASTER_COL.SAFETY_CREDIT, safety ? '=S' + sheetRow : 0);
+  setArrayCol(row, MASTER_COL.DOM_INTL, determineDomesticIntl(official.dep, official.arr));
+  setArrayCol(row, MASTER_COL.CUM_BLOCK, '=SUM($Q$2:Q' + sheetRow + ')');
+  setArrayCol(row, MASTER_COL.CUM_CREDIT, '=SUM($S$2:S' + sheetRow + ')');
+
+  setArrayCol(row, MASTER_COL.VERIFICATION, 'SOURCE IMPORTED');
+  setArrayCol(row, MASTER_COL.SOURCE_ID, sourceId);
+  setArrayCol(row, MASTER_COL.REMARKS, 'Added from Official PDF Import; user post-flight inputs pending.');
+  setArrayCol(row, MASTER_COL.OP_TYPE, safety ? 'SAFETY PILOT' : 'LINE');
+  setArrayCol(row, MASTER_COL.CREW, crew && crew.crewType ? crew.crewType : '');
+  setArrayCol(
+    row,
+    MASTER_COL.CREDIT_BASIS,
+    durationMinutes_(official.molitTime) !== durationMinutes_(official.block)
+      ? 'MOLIT / Authority Credited Time (partial crew credit)'
+      : 'MOLIT / Authority Credited Time'
+  );
+
+  setArrayCol(row, MASTER_COL.PIC_STATUS, crew && crew.pic ? 'ROSTER CONFIRMED' : '');
+  setArrayCol(
+    row,
+    MASTER_COL.CREW_SOURCE,
+    queue
+      ? String(queue[QUEUE_COL.SOURCE - 1] || '') + ' + Flight Log Report'
+      : 'Flight Log Report'
+  );
+
+  setArrayCol(row, MASTER_COL.APP_TYPE_MIRROR, '=IF(C' + sheetRow + '="","",C' + sheetRow + ')');
+  setArrayCol(row, MASTER_COL.APP_NO_MIRROR, '=IF(D' + sheetRow + '="","",D' + sheetRow + ')');
+
+  setArrayCol(row, MASTER_COL.MONTH, official.date.slice(0, 7));
+  setArrayCol(row, MASTER_COL.OPERATOR, 'Korean Air');
+  setArrayCol(row, MASTER_COL.TYPE_RAW, official.aircraftType);
+  setArrayCol(
+    row,
+    MASTER_COL.STANDARD_TYPE,
+    official.aircraftType === '3QP' ? CONFIG.STANDARD_TYPE_32S : official.aircraftType
+  );
+  setArrayCol(row, MASTER_COL.BT_SOURCE, 'Flight Log Report');
+  setArrayCol(row, MASTER_COL.RECORD_STATUS, 'OFFICIAL CONFIRMED');
+  setArrayCol(row, MASTER_COL.INBOX_NOTE, 'Official source imported; user post-flight inputs pending');
+  setArrayCol(row, MASTER_COL.POSTFLIGHT_STATUS, 'PENDING USER INPUT');
+
+  if (queue) {
+    setArrayCol(
+      row,
+      MASTER_COL.CAL_OUT_KST,
+      queue[QUEUE_COL.LATEST_OUT - 1] || queue[QUEUE_COL.ORIGINAL_OUT - 1] || ''
+    );
+    setArrayCol(
+      row,
+      MASTER_COL.CAL_IN_KST,
+      queue[QUEUE_COL.LATEST_IN - 1] || queue[QUEUE_COL.ORIGINAL_IN - 1] || ''
+    );
+    setArrayCol(row, MASTER_COL.EVENT_ID, queue[QUEUE_COL.EVENT_ID - 1] || '');
+  }
+
+  setArrayCol(
+    row,
+    MASTER_COL.SYNC_NOTE,
+    item.queueDate && item.queueDate !== official.date
+      ? 'Official PDF Import linked across Calendar/Official date boundary: Queue ' +
+        item.queueDate + ' ↔ Official ' + official.date + '.'
+      : 'Created by Official PDF Import.'
+  );
+
+  return { row: row, logId: logId };
+}
+
+
+function appendOfficialMasterRow_(sheet, item, sourceId, queueRows) {
+  const sheetRow = sheet.getLastRow() + 1;
+  const built = buildOfficialNewMasterRow_(sheetRow, item, sourceId, queueRows);
+
+  if (sheetRow > 2) {
+    sheet.getRange(sheetRow - 1, 1, 1, 70).copyTo(
+      sheet.getRange(sheetRow, 1, 1, 70),
+      SpreadsheetApp.CopyPasteType.PASTE_FORMAT,
+      false
+    );
+  }
+
+  sheet.getRange(sheetRow, 1, 1, 70).setValues([built.row]);
+  return built.logId;
+}
+
+
+function markQueueOfficialByRow_(queueSheet, queueRow, logId) {
+  if (!queueRow) return;
+  queueSheet.getRange(queueRow, QUEUE_COL.STATUS).setValue('MASTER / OFFICIAL');
+  queueSheet.getRange(queueRow, QUEUE_COL.MASTER_LOG_ID).setValue(logId);
+}
+
+
+function appendOfficialImportAudit_(sheet, preview, sourceId, sourceUrl, applied, backupUrl) {
+  const now = Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'yyyy-MM-dd HH:mm') + ' KST';
+  const prefix =
+    'KALLOG-' +
+    preview.source.coverageTo.replace(/-/g, '') +
+    '-' +
+    preview.source.sha256.slice(0, 8).toUpperCase();
+
+  const matchCount = preview.counts.ALREADY_OFFICIAL;
+
+  if (matchCount) {
+    sheet.appendRow([
+      prefix + '-VERIFY',
+      sourceUrl || sourceId,
+      now,
+      matchCount + ' prior sectors',
+      'Prior official sectors',
+      'MATCH current official values',
+      'Existing OFFICIAL CONFIRMED Master',
+      '0 changed sectors',
+      'MATCH',
+      now,
+      'Idempotent overlap verification. Backup: ' + (backupUrl || ''),
+      'PDF parser'
+    ]);
+  }
+
+  preview.items.forEach(function(item) {
+    if (item.status === 'ALREADY_OFFICIAL') return;
+
+    const logId = applied[item.index] || item.masterLogId || (
+      item.status === 'EXCLUDED'
+        ? item.record.flight + ' ' + item.record.dep + '-' + item.record.arr
+        : ''
+    );
+
+    const status =
+      item.status === 'MATCHED_PROVISIONAL'
+        ? 'OFFICIALIZED'
+        : item.status === 'NEW'
+        ? 'ADDED'
+        : item.status === 'EXCLUDED'
+        ? 'CONFIRMED / EXCLUDED'
+        : item.status;
+
+    const previous =
+      item.masterLogId
+        ? 'Existing Master ' + item.masterLogId
+        : item.queueRow
+        ? 'SCHEDULE_QUEUE only'
+        : 'No prior Master/Queue match';
+
+    const difference = item.changes && item.changes.length
+      ? item.changes.map(function(change) {
+          return change.field + ' ' + (change.before || 'blank') + ' → ' + (change.after || 'blank');
+        }).join('; ')
+      : item.reason;
+
+    sheet.appendRow([
+      prefix + '-' + item.record.flight + '-' + String(item.index + 1),
+      sourceUrl || sourceId,
+      now,
+      logId,
+      item.status === 'EXCLUDED' ? 'Deadhead/travel evidence' : 'Official sector reconciliation',
+      officialFieldSummary_(item.record),
+      previous,
+      difference,
+      status,
+      now,
+      item.reason + ' User-owned post-flight fields preserved. Backup: ' + (backupUrl || ''),
+      'PDF parser'
+    ]);
+  });
+}
+
+
+function parseCoverage_(value) {
+  const match = String(value || '').match(/(20\d{2}-\d{2}-\d{2})\s+to\s+(20\d{2}-\d{2}-\d{2})/);
+  if (!match) return null;
+  return { from: match[1], to: match[2] };
+}
+
+
+function addOneDayString_(dateString) {
+  const date = new Date(dateString + 'T00:00:00Z');
+  date.setUTCDate(date.getUTCDate() + 1);
+  return Utilities.formatDate(date, 'UTC', 'yyyy-MM-dd');
+}
+
+
+function extractDriveFileIdFromNotes_(notes) {
+  const match = String(notes || '').match(/DriveFileId=([A-Za-z0-9_-]+)/);
+  return match ? match[1] : '';
+}
+
+
+function mapFolderFiles_(folder, storage) {
+  const mapById = {};
+  const mapByName = {};
+  const iterator = folder.getFiles();
+
+  while (iterator.hasNext()) {
+    const file = iterator.next();
+    const info = {
+      file: file,
+      id: file.getId(),
+      name: file.getName(),
+      url: file.getUrl(),
+      storage: storage
+    };
+
+    mapById[info.id] = info;
+    if (!mapByName[info.name]) mapByName[info.name] = [];
+    mapByName[info.name].push(info);
+  }
+
+  return { byId: mapById, byName: mapByName };
+}
+
+
+function mergeFileMaps_(a, b) {
+  const byId = {};
+  const byName = {};
+
+  [a, b].forEach(function(map) {
+    Object.keys(map.byId).forEach(function(id) {
+      byId[id] = map.byId[id];
+    });
+
+    Object.keys(map.byName).forEach(function(name) {
+      if (!byName[name]) byName[name] = [];
+      byName[name] = byName[name].concat(map.byName[name]);
+    });
+  });
+
+  return { byId: byId, byName: byName };
+}
+
+
+function selectMinimalCoverageIntervals_(intervals) {
+  if (!intervals.length) return { selected: {}, gap: false };
+
+  const earliest = intervals.reduce(function(min, item) {
+    return !min || item.from < min ? item.from : min;
+  }, '');
+
+  const latest = intervals.reduce(function(max, item) {
+    return !max || item.to > max ? item.to : max;
+  }, '');
+
+  const selected = {};
+  let cursor = earliest;
+
+  while (cursor <= latest) {
+    const candidates = intervals.filter(function(item) {
+      return item.from <= cursor && item.to >= cursor;
+    }).sort(function(a, b) {
+      return b.to.localeCompare(a.to);
+    });
+
+    if (!candidates.length) {
+      return {
+        selected: selected,
+        gap: true,
+        gapAt: cursor,
+        earliest: earliest,
+        latest: latest
+      };
+    }
+
+    const best = candidates[0];
+    selected[best.fileInfo.id] = true;
+
+    if (best.to >= latest) break;
+    cursor = addOneDayString_(best.to);
+  }
+
+  return {
+    selected: selected,
+    gap: false,
+    earliest: earliest,
+    latest: latest
+  };
+}
+
+
+function optimizeOfficialPdfCoverage_(documentSheet) {
+  const activeFolder = DriveApp.getFolderById(CONFIG.OFFICIAL_ACTIVE_FOLDER_ID);
+  const archiveFolder = DriveApp.getFolderById(CONFIG.OFFICIAL_ARCHIVE_FOLDER_ID);
+  const files = mergeFileMaps_(
+    mapFolderFiles_(activeFolder, 'ACTIVE'),
+    mapFolderFiles_(archiveFolder, 'ARCHIVED_REDUNDANT')
+  );
+
+  const rows = documentSheet.getLastRow() >= 2
+    ? documentSheet.getRange(2, 1, documentSheet.getLastRow() - 1, 9).getDisplayValues()
+    : [];
+
+  const intervals = [];
+  const warnings = [];
+
+  rows.forEach(function(row, index) {
+    if (String(row[1] || '').trim() !== 'Flight Log Report') return;
+
+    const coverage = parseCoverage_(row[4]);
+    if (!coverage) return;
+
+    const fileId = extractDriveFileIdFromNotes_(row[8]);
+    let fileInfo = fileId ? files.byId[fileId] : null;
+
+    if (!fileInfo) {
+      const matches = files.byName[String(row[7] || '').trim()] || [];
+      if (matches.length === 1) fileInfo = matches[0];
+      if (matches.length > 1) {
+        warnings.push('Ambiguous physical PDF filename: ' + String(row[7] || ''));
+      }
+    }
+
+    if (!fileInfo) return;
+
+    intervals.push({
+      from: coverage.from,
+      to: coverage.to,
+      fileInfo: fileInfo,
+      documentRow: index + 2
+    });
+  });
+
+  const plan = selectMinimalCoverageIntervals_(intervals);
+
+  if (plan.gap) {
+    return {
+      changed: false,
+      warning: 'Coverage gap detected at ' + plan.gapAt + '; no archive moves performed.',
+      warnings: warnings
+    };
+  }
+
+  const movedToActive = [];
+  const movedToArchive = [];
+
+  intervals.forEach(function(interval) {
+    const selected = !!plan.selected[interval.fileInfo.id];
+
+    if (selected && interval.fileInfo.storage !== 'ACTIVE') {
+      interval.fileInfo.file.moveTo(activeFolder);
+      movedToActive.push(interval.fileInfo.name);
+      interval.fileInfo.storage = 'ACTIVE';
+    } else if (!selected && interval.fileInfo.storage === 'ACTIVE') {
+      interval.fileInfo.file.moveTo(archiveFolder);
+      movedToArchive.push(interval.fileInfo.name);
+      interval.fileInfo.storage = 'ARCHIVED_REDUNDANT';
+    }
+
+    const oldNotes = String(
+      documentSheet.getRange(interval.documentRow, 9).getDisplayValue() || ''
+    );
+    const stripped = oldNotes
+      .replace(/\s*Storage=(ACTIVE|ARCHIVED_REDUNDANT|IMPORTING|FAILED)\b/g, '')
+      .trim();
+
+    documentSheet.getRange(interval.documentRow, 9).setValue(
+      stripped + ' Storage=' + interval.fileInfo.storage
+    );
+  });
+
+  return {
+    changed: movedToActive.length > 0 || movedToArchive.length > 0,
+    coverageFrom: plan.earliest,
+    coverageTo: plan.latest,
+    movedToActive: movedToActive,
+    movedToArchive: movedToArchive,
+    warnings: warnings
+  };
+}
+
+
+function confirmOfficialImportUncached_(payload) {
+  const source = validateOfficialImportPayload_(payload, true);
+  const preview = buildOfficialImportPreview_(payload);
+
+  if (preview.hasMismatches) {
+    throw new Error(
+      'Import blocked: ' + preview.counts.MISMATCH +
+      ' official mismatch(es) require manual review.'
+    );
+  }
+
+  if (preview.alreadyImported) {
+    return {
+      status: 'ALREADY_IMPORTED',
+      sourceId: preview.registeredSourceId || preview.sourceId,
+      counts: preview.counts,
+      message: 'This PDF is already represented by the current official Master state.'
+    };
+  }
+
+  const ss = openFlightSpreadsheet_(CONFIG.SPREADSHEET_ID);
+  const masterSheet = ss.getSheetByName(CONFIG.MASTER_SHEET);
+  const queueSheet = ss.getSheetByName(CONFIG.QUEUE_SHEET);
+  const documentSheet = ss.getSheetByName(CONFIG.DOCUMENT_REGISTER_SHEET);
+  const auditSheet = ss.getSheetByName(CONFIG.OFFICIAL_IMPORT_SHEET);
+
+  if (!masterSheet || !queueSheet || !documentSheet || !auditSheet) {
+    throw new Error('Required official-import sheets are missing.');
+  }
+
+  const sourceId = preview.sourceId;
+  const staged = createStagedOfficialPdf_(source, payload.pdfBase64);
+  const documentRow = appendDocumentRegister_(
+    documentSheet,
+    sourceId,
+    source,
+    staged,
+    'IMPORTING',
+    'Awaiting Master reconciliation.'
+  );
+
+  let backup = null;
+
+  try {
+    backup = createOfficialImportBackup_();
+
+    const queueRows = queueSheet.getLastRow() >= 2
+      ? queueSheet.getRange(2, 1, queueSheet.getLastRow() - 1, 14).getDisplayValues()
+      : [];
+
+    const applied = {};
+
+    preview.items.forEach(function(item) {
+      let logId = item.masterLogId || '';
+
+      if (item.status === 'MATCHED_PROVISIONAL') {
+        logId = applyOfficialToExistingRow_(masterSheet, item, sourceId);
+      } else if (item.status === 'NEW') {
+        logId = appendOfficialMasterRow_(masterSheet, item, sourceId, queueRows);
+      } else if (item.status === 'MISMATCH') {
+        throw new Error('Unexpected mismatch during confirm.');
+      }
+
+      if (
+        item.status === 'MATCHED_PROVISIONAL' ||
+        item.status === 'NEW' ||
+        item.status === 'ALREADY_OFFICIAL'
+      ) {
+        if (item.queueRow && logId) {
+          markQueueOfficialByRow_(queueSheet, item.queueRow, logId);
+        }
+      }
+
+      if (logId) applied[item.index] = logId;
+    });
+
+    SpreadsheetApp.flush();
+
+    // Move the exact uploaded original out of staging only after Master writes succeed.
+    staged.file.moveTo(DriveApp.getFolderById(CONFIG.OFFICIAL_ACTIVE_FOLDER_ID));
+
+    updateDocumentRegisterStorage_(
+      documentSheet,
+      documentRow,
+      source,
+      staged,
+      'ACTIVE',
+      'Official PDF Import confirmed. Backup=' + (backup ? backup.url : '')
+    );
+
+    appendOfficialImportAudit_(
+      auditSheet,
+      preview,
+      sourceId,
+      staged.url,
+      applied,
+      backup ? backup.url : ''
+    );
+
+    const storage = optimizeOfficialPdfCoverage_(documentSheet);
+
+    SpreadsheetApp.flush();
+
+    // Verification: every actionable record must now resolve to OFFICIAL.
+    const verification = buildOfficialImportPreview_({
+      source: source,
+      records: payload.records
+    });
+
+    if (
+      verification.counts.MATCHED_PROVISIONAL !== 0 ||
+      verification.counts.NEW !== 0 ||
+      verification.counts.MISMATCH !== 0
+    ) {
+      throw new Error(
+        'Post-import verification failed. Backup retained: ' +
+        (backup ? backup.url : '')
+      );
+    }
+
+    return {
+      status: 'IMPORTED',
+      sourceId: sourceId,
+      driveFileId: staged.id,
+      driveUrl: staged.url,
+      counts: preview.counts,
+      verificationCounts: verification.counts,
+      backup: backup,
+      storage: storage
+    };
+
+  } catch (error) {
+    try {
+      updateDocumentRegisterStorage_(
+        documentSheet,
+        documentRow,
+        source,
+        staged,
+        'FAILED',
+        'Import failed. Staged original retained. Backup=' +
+          (backup ? backup.url : '') +
+          ' Error=' +
+          (error && error.message ? error.message : String(error))
+      );
+      SpreadsheetApp.flush();
+    } catch (ignored) {}
+
+    throw error;
+  }
 }
