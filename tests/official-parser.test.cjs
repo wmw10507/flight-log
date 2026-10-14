@@ -29,7 +29,7 @@ const { parseKoreanAirFlightLogText } = loadParser();
 
 test("Korean Air parser handles JasperReports rows concatenated without line breaks", () => {
   const text =
-    "Flight Log Report WOO MYUNG WOO | 2594423 | 32S | FO " +
+    "Flight Log Report WOO MYUNG WOO | 2594423 | 32S | FO Generated 2026-10-14 " +
     "2026-10-01 HL8556 3QP KE2085 PUS TPE F 23:57 02:19 02:22 02:22 02:22 00:00 02:00 Y Y N" +
     "2026-10-06 HL8528 3QP KE163 ICN DYG GF 10:29 14:12 03:43 01:52 01:52 03:43 03:10 Y Y N" +
     "2026-10-06 HL8528 3QP KE164 DYG ICN GF 15:26 18:27 03:01 01:31 01:31 03:01 02:35 N N";
