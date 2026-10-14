@@ -162,6 +162,8 @@ function captainKey(name: string) {
 const APP_VERSION = "0.3.0";
 const readActions = new Set(["getAppData", "getHistoryMonth", "getRecencyData", "getCaptains", "getCaptainProfile", "getCaptainCard"]);
 const clientReads = new Map<string, { value: unknown; expires: number }>();
+// API payloads vary by action; callers narrow the returned shape.
+ // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const pendingReads = new Map<string, Promise<any>>();
 let clientGeneration = 0;
 
@@ -171,6 +173,7 @@ function invalidateClientReads() {
   pendingReads.clear();
 }
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function apiCall(action: string, payload?: unknown, fresh = false): Promise<any> {
   const isRead = readActions.has(action);
   // Always isolate writes from prior reads, including ambiguous network failures.
@@ -573,6 +576,8 @@ export default function Home() {
         stored === "dark"
       ) {
 
+        // Initial client-only theme hydration.
+        // eslint-disable-next-line react-hooks/set-state-in-effect
         setTheme(stored);
         return;
       }
@@ -625,6 +630,8 @@ export default function Home() {
         return;
       }
 
+      // Form state intentionally mirrors the newly selected flight.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setPfpm(
         selectedFlight
           .pfpmOverride ||
