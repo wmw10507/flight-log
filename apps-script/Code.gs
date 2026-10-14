@@ -6581,7 +6581,7 @@ function applyOfficialToExistingRow_(sheet, item, sourceId) {
   sheet.getRange(row, MASTER_COL.AUTOLAND).setValue(official.autoland);
 
   // Derived company log columns. User-owned overrides live elsewhere.
-  sheet.getRange(row, MASTER_COL.DAY).setFormula('=MAX(0,S' + row + '-U' + row + ')');
+  sheet.getRange(row, MASTER_COL.DAY).setFormula('=MAX(0,Q' + row + '-U' + row + ')');
   sheet.getRange(row, MASTER_COL.IFR).setFormula('=V' + row);
   sheet.getRange(row, MASTER_COL.PFPM).setFormula(
     '=IF(AS' + row + '<>"",AS' + row + ',IF(AND(Z' + row + '="Y",AA' + row + '="Y"),"PF","PM"))'
@@ -6644,7 +6644,7 @@ function buildOfficialNewMasterRow_(sheetRow, item, sourceId, queueRows) {
   setArrayCol(row, MASTER_COL.BLOCK, durationFraction_(official.block));
   setArrayCol(row, MASTER_COL.COMPANY, durationFraction_(official.companyTime));
   setArrayCol(row, MASTER_COL.MOLIT, durationFraction_(official.molitTime));
-  setArrayCol(row, MASTER_COL.DAY, '=MAX(0,S' + sheetRow + '-U' + sheetRow + ')');
+  setArrayCol(row, MASTER_COL.DAY, '=MAX(0,Q' + sheetRow + '-U' + sheetRow + ')');
   setArrayCol(row, MASTER_COL.NIGHT, durationFraction_(official.night));
   setArrayCol(row, MASTER_COL.INST, durationFraction_(official.inst));
   setArrayCol(row, MASTER_COL.IFR, '=V' + sheetRow);
