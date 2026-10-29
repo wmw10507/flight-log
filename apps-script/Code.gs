@@ -3268,7 +3268,7 @@ function parseCrewMemo(
 
   const pic =
     picMatch
-      ? picMatch[1].trim()
+      ? cleanCaptainDisplayName_(picMatch[1])
       : '';
 
 
@@ -5439,19 +5439,19 @@ function saveCaptainProfileUncached_(payload) {
    HELPERS
 ========================================================= */
 
+function cleanCaptainDisplayName_(value) {
+  return String(value || '')
+    .trim()
+    .replace(/\s*[([]\s*(?:CAP\s*\/\s*P1|CAP|P1)\s*[)\]]\s*$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function normalizeCaptainName_(
   value
 ) {
 
-  return String(
-    value || ''
-  )
-    .trim()
-    .replace(
-      /\s+/g,
-      ' '
-    )
-    .toUpperCase();
+  return cleanCaptainDisplayName_(value).toUpperCase();
 }
 
 
@@ -5595,7 +5595,7 @@ function getCaptains() {
 
 
 /* v0.2.6: caches never supply write/identity decisions. */
-const BACKEND_VERSION = '0.3.2-import-v1';
+const BACKEND_VERSION = '0.3.3-captain-name';
 const flightExecution_ = { spreadsheets: {}, masterIndex: null };
 
 function openFlightSpreadsheet_(id) {
