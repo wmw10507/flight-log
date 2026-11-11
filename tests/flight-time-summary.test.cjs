@@ -7,13 +7,13 @@ const code = fs.readFileSync(path.join(__dirname, '../apps-script/Code.gs'), 'ut
 
 function flight(id, date, status, block, molit, duty = 'F', position = 'FO') {
   const row = Array(64).fill('');
-  Object.assign(row, { 0: id, 1: date, 11: duty, 12: position, 16: block, 18: molit, 63: status });
+  Object.assign(row, { 0: id, 1: date, 11: duty, 12: position, 16: block, 18: molit, 60: '3QP', 61: 'A321-272NX', 63: status });
   return row;
 }
 
 function certificate(type, aircraftClass, subtotal, verification) {
   const row = Array(29).fill('');
-  Object.assign(row, { 1: type, 6: aircraftClass, 15: subtotal, 28: verification });
+  Object.assign(row, { 1: type, 5: type.startsWith('Civil') ? 'M20J' : 'KT1', 6: aircraftClass, 15: subtotal, 28: verification });
   return row;
 }
 
@@ -52,6 +52,13 @@ test('personal totals separate official and pending flights across Korean date p
   vm.runInContext(code, ctx);
   const summary = JSON.parse(JSON.stringify(ctx.getFlightTimeSummary()));
   assert.equal(summary.historicalMinutes, 220 * 60 + 42);
+  assert.deepEqual(summary.aircraft, [
+    { aircraft: 'M20J', total: 6990, year: 0, month: 0 },
+    { aircraft: 'KT1', total: 6252, year: 0, month: 0 },
+    { aircraft: 'A321-272NX', total: 710, year: 230, month: 140 },
+  ]);
+  assert.equal(summary.aircraft.reduce((total, row) => total + row.total, 0),
+    summary.historicalMinutes + summary.periods.total.officialMolit);
   assert.deepEqual(summary.periods, {
     total: { officialBlock: 905, officialMolit: 710, officialSectors: 3, pendingBlock: 238, pendingMolit: 0, pendingSectors: 1 },
     year: { officialBlock: 355, officialMolit: 230, officialSectors: 2, pendingBlock: 238, pendingMolit: 0, pendingSectors: 1 },
