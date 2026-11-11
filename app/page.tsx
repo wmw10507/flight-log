@@ -224,6 +224,68 @@ async function apiCall(action: string, payload?: unknown, fresh = false): Promis
   finally { if (pendingReads.get(key) === request) pendingReads.delete(key); }
 }
 
+function FlightCaptainEditor({ flight, onSaved }: {
+  flight: Flight;
+  onSaved: (eventId: string, captain: string) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [name, setName] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  if (!flight.eventId) return null;
+  if (!editing) {
+    return (
+      <button type="button" onClick={() => {
+        setName(flight.pic || "");
+        setError("");
+        setEditing(true);
+      }} className="mt-2 rounded-lg bg-[var(--blue-soft)] px-3 py-2 text-sm font-semibold text-[var(--blue)]">
+        {flight.pic ? "기장 수정" : "기장 추가"}
+      </button>
+    );
+  }
+
+  async function save() {
+    if (!name.trim() || saving) return;
+    setSaving(true);
+    setError("");
+    try {
+      const result: { eventId: string; captain: string } = await apiCall("saveFlightCaptain", {
+        eventId: flight.eventId, masterLogId: flight.masterLogId,
+        date: flight.date, flight: flight.flight, dep: flight.dep, arr: flight.arr,
+        previousCaptain: flight.pic, captain: name.trim(),
+      });
+      onSaved(result.eventId, result.captain);
+      setEditing(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "기장 이름을 저장하지 못했습니다.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <form className="mt-3 space-y-2" onSubmit={event => { event.preventDefault(); void save(); }}>
+      <label className="block text-sm font-semibold">
+        기장 이름
+        <input required maxLength={80} autoComplete="off" value={name} disabled={saving}
+          onChange={event => setName(event.target.value)}
+          className="mt-1 block w-full max-w-80 rounded-lg border border-[var(--line)] bg-[var(--surface)] px-3 py-2 text-base" />
+      </label>
+      <div className="flex flex-wrap gap-2">
+        <button type="submit" disabled={saving || !name.trim()}
+          className="rounded-lg bg-[var(--blue-soft)] px-3 py-2 text-sm font-semibold text-[var(--blue)] disabled:opacity-40">
+          {saving ? "저장 중…" : "기장 저장"}
+        </button>
+        <button type="button" disabled={saving} onClick={() => setEditing(false)}
+          className="rounded-lg bg-[var(--soft)] px-3 py-2 text-sm">취소</button>
+      </div>
+      {error && <p role="alert" className="text-sm text-[var(--danger)]">{error}</p>}
+    </form>
+  );
+}
+
 /* =========================================================
    THEME
 ========================================================= */
@@ -693,6 +755,14 @@ export default function Home() {
   );
 
   const selectedCaptain = selectedFlight?.pic?.trim() || "";
+  function applyFlightCaptain(eventId: string, captain: string) {
+    const update = (flights: Flight[]) =>
+      flights.map(flight => flight.eventId === eventId ? { ...flight, pic: captain } : flight);
+    setPastFlights(update);
+    setUpcomingRotation(update);
+    setCaptainsLoaded(false);
+    setTodayCaptainRetry(value => value + 1);
+  }
   const todayCaptainKey = selectedCaptain + ":" + todayCaptainRetry;
   const todayCaptainLoading = Boolean(selectedCaptain) && todayCaptainResult?.key !== todayCaptainKey;
   const todayCaptain = todayCaptainResult?.key === todayCaptainKey ? todayCaptainResult.profile : null;
@@ -1923,6 +1993,8 @@ export default function Home() {
                                   ) : null}
                                 </div>
 
+                                <FlightCaptainEditor key={selectedFlight.eventId} flight={selectedFlight} onSaved={applyFlightCaptain} />
+
                                 <div className="mt-5 rounded-[18px] bg-[var(--soft)] px-4 py-4">
 
                                   <div className="text-[13px] font-semibold text-[var(--muted)]">
@@ -1937,6 +2009,16 @@ export default function Home() {
 
                               </section>
 
+
+                            </>
+                          )
+                          : (
+                            <EmptyState
+                              title="최근 비행이 없어요"
+                              text="현재 조회 범위에 완료된 비행이 없습니다."
+                            />
+                          )
+                      }
 
                               {/* NEXT ROTATION */}
 
@@ -2012,6 +2094,10 @@ export default function Home() {
 
                                                 </div>
 
+                                                <div className="mt-2 text-sm text-[var(--text-2)]">
+                                                  기장: {flight.pic || "미등록"}
+                                                </div>
+                                                <FlightCaptainEditor flight={flight} onSaved={applyFlightCaptain} />
                                               </div>
 
 
@@ -2040,18 +2126,6 @@ export default function Home() {
                                 </div>
 
                               </section>
-
-                            </>
-                          )
-
-                          : (
-
-                            <EmptyState
-                              title="최근 비행이 없어요"
-                              text="현재 조회 범위에 완료된 비행이 없습니다."
-                            />
-                          )
-                      }
 
                     </>
                   )

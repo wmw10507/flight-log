@@ -3254,7 +3254,7 @@ function parseCrewMemo(
     );
 
 
-  const picMatch =
+  const picMatch = memo.match(/^Manual captain: ([^;\r\n]+);(?:\r?\n|$)/) ||
     memo.match(
       /PIC\s+([^;]+)/i
     );
@@ -3268,7 +3268,7 @@ function parseCrewMemo(
 
   const pic =
     picMatch
-      ? picMatch[1].trim()
+      ? cleanCaptainDisplayName_(picMatch[1])
       : '';
 
 
@@ -4804,6 +4804,10 @@ function doPost(e) {
       });
     }
 
+    if (action === 'saveFlightCaptain') {
+      return jsonResponse_({ ok: true, data: saveFlightCaptain(payload) });
+    }
+
 
     // =====================================================
     // HISTORY
@@ -5439,19 +5443,19 @@ function saveCaptainProfileUncached_(payload) {
    HELPERS
 ========================================================= */
 
+function cleanCaptainDisplayName_(value) {
+  return String(value || '')
+    .trim()
+    .replace(/\s*[([]\s*(?:CAP\s*\/\s*P1|CAP|P1)\s*[)\]]\s*$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function normalizeCaptainName_(
   value
 ) {
 
-  return String(
-    value || ''
-  )
-    .trim()
-    .replace(
-      /\s+/g,
-      ' '
-    )
-    .toUpperCase();
+  return cleanCaptainDisplayName_(value).toUpperCase();
 }
 
 
@@ -5595,7 +5599,7 @@ function getCaptains() {
 
 
 /* v0.2.6: caches never supply write/identity decisions. */
-const BACKEND_VERSION = '0.3.2-import-v1';
+const BACKEND_VERSION = '0.3.4-manual-captain';
 const flightExecution_ = { spreadsheets: {}, masterIndex: null };
 
 function openFlightSpreadsheet_(id) {
@@ -5661,6 +5665,54 @@ function withFlightMutation_(write) {
 
 function savePostFlight(payload) {
   return withFlightMutation_(function() { return savePostFlightUncached_(payload); });
+}
+
+// A captain assignment is independent of confirming that a flight was flown.
+function saveFlightCaptain(payload) {
+  if (!payload || typeof payload.eventId !== 'string' || !payload.eventId.trim()) {
+    throw new Error('비행을 다시 선택해 주세요.');
+  }
+  const name = cleanCaptainDisplayName_(payload && typeof payload.captain === 'string' ? payload.captain : '');
+  if (!/^[\p{L}][\p{L}\p{M} .'’\-]{0,79}$/u.test(name)) {
+    throw new Error('기장 이름을 확인해 주세요.');
+  }
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    return withFlightMutation_(function() {
+      const flights = getQueueFlights().filter(f => f.eventId === payload.eventId);
+      const flight = flights.length === 1 ? flights[0] : null;
+      if (!flight || flight.date !== payload.date || flight.flight !== payload.flight ||
+          flight.dep !== payload.dep || flight.arr !== payload.arr ||
+          flight.masterLogId !== (payload.masterLogId || '') ||
+          normalizeCaptainName_(flight.pic) !== normalizeCaptainName_(payload.previousCaptain)) {
+        throw new Error('비행 또는 기장 정보가 변경됐습니다. 새로고침 후 다시 시도해 주세요.');
+      }
+
+      const ss = openFlightSpreadsheet_(CONFIG.SPREADSHEET_ID);
+      const master = findMasterForQueue_(buildMasterIndex(), flight);
+      if ((flight.masterLogId && !master) ||
+          (master && (master.flight !== flight.flight || master.dep !== flight.dep || master.arr !== flight.arr))) {
+        throw new Error('연결된 비행 기록을 확인할 수 없습니다.');
+      }
+      const queue = ss.getSheetByName(CONFIG.QUEUE_SHEET);
+      const notes = ss.getSheetByName('CAPTAIN_NOTES');
+      const masterSheet = ss.getSheetByName(CONFIG.MASTER_SHEET);
+      const memoCell = queue.getRange(flight.queueRow, QUEUE_COL.MEMO);
+      const oldMemo = memoCell.getDisplayValues()[0][0];
+      const captainRows = Math.max(0, notes.getLastRow() - 3);
+      const known = captainRows ? notes.getRange(4, 1, captainRows, 1).getDisplayValues() : [];
+      const existing = known.find(row => normalizeCaptainName_(row[0]) === normalizeCaptainName_(name));
+      const captain = existing ? cleanCaptainDisplayName_(existing[0]) : name.toUpperCase();
+      if (!existing) notes.getRange(Math.max(4, notes.getLastRow() + 1), 1).setValue(captain);
+      const sourceMemo = oldMemo.replace(/^Manual captain: [^;\r\n]+;(?:\r?\n|$)/, '');
+      memoCell.setValue('Manual captain: ' + captain + ';' + (sourceMemo ? '\n' + sourceMemo : ''));
+      if (master) masterSheet.getRange(master.sheetRow, MASTER_COL.PIC).setValue(captain);
+      return { eventId: flight.eventId, captain: captain };
+    });
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 function syncScheduleQueueFromFltSch() {

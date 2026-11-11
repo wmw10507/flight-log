@@ -22,10 +22,10 @@ function queue(date, no, dep, arr, id, event = 'evt-' + no) {
   return [event, date, no, dep, arr, dep + '-' + arr,
     date + ' 00:30', date + ' 03:30', '', '', 'MASTER / OFFICIAL', '', id, 'CALENDAR'];
 }
-function env(rows, queued) {
+function env(rows, queued, notes = [[], []]) {
   const writes = [];
   const ranges = [];
-  const sheets = Object.fromEntries(Object.entries({ FLIGHT_LOG_MASTER: rows, SCHEDULE_QUEUE: queued }).map(([name, data]) => [name, {
+  const sheets = Object.fromEntries(Object.entries({ FLIGHT_LOG_MASTER: rows, SCHEDULE_QUEUE: queued, CAPTAIN_NOTES: notes }).map(([name, data]) => [name, {
     getLastRow: () => data.length + 1,
     getRange(r, c, n = 1, w = 1) {
       return {
@@ -33,7 +33,7 @@ function env(rows, queued) {
           ranges.push([name, r, c, n, w]);
           return Array.from({ length: n }, (_, i) => Array.from({ length: w }, (_, j) => data[r - 2 + i]?.[c - 1 + j] ?? ''));
         },
-        setValue(value) { writes.push([name, r, c, value]); data[r - 2][c - 1] = value; }
+        setValue(value) { writes.push([name, r, c, value]); (data[r - 2] ||= [])[c - 1] = value; }
       };
     },
     appendRow(row) { writes.push([name, 'append']); data.push([...row]); }
@@ -55,6 +55,42 @@ function env(rows, queued) {
 const id164 = 'KAL-20261006-KE164-DYG-ICN';
 const payload = { eventId: 'evt-KE164', masterLogId: id164, approachType: 'ILS33R', approachNo: '1', pfpmOverride: 'PM', comment: 'user comment',
   takeoff: 'N', landing: 'Y', registration: 'ATTEMPTED OVERWRITE', block: '9:59', outGmt: '01:00', molit: '9:59' };
+
+test('manual captain on an upcoming flight persists without logging the flight as flown', () => {
+  const q = queue('2026-10-09', 'KE164', 'DYG', 'ICN', '');
+  q[10] = 'SCHEDULED';
+  q[11] = 'FDT KIM TEST; USER=FO; source note';
+  const before = [...q];
+  const e = env([], [q]);
+  const request = { eventId: q[0], date: q[1], flight: q[2], dep: q[3], arr: q[4], captain: ' an  geewon ' };
+  assert.deepEqual(e.run('saveFlightCaptain(' + JSON.stringify(request) + ')'), { eventId: q[0], captain: 'AN GEEWON' });
+  assert.deepEqual(e.writes.map(w => w.slice(0, 3)), [['CAPTAIN_NOTES', 4, 1], ['SCHEDULE_QUEUE', 2, 12]]);
+  assert.deepEqual(q.filter((_, i) => i !== 11), before.filter((_, i) => i !== 11));
+  assert.ok(q[11].endsWith(before[11]));
+  const result = e.run('getAppData()');
+  assert.equal(result.pastFlights.length, 0);
+  assert.equal(result.upcomingRotation[0].pic, 'AN GEEWON');
+  assert.equal(result.upcomingRotation[0].safetyPilot, true);
+});
+
+test('manual captain rejects stale edits and updates only the linked Master PIC and Queue memo', () => {
+  const correct = master('2026-10-06', 'KE164', 'DYG', 'ICN', id164);
+  const wrong = master('2026-10-07', 'KE164', 'DYG', 'ICN', 'wrong-id');
+  const q = queue('2026-10-07', 'KE164', 'DYG', 'ICN', id164);
+  const notes = [[], [], ['AN GEEWON', '', '', '', '', 'existing note', 'existing tags']];
+  const original = [...correct], other = [...wrong], note = [...notes[2]];
+  const e = env([correct, wrong], [q], notes);
+  const request = { eventId: q[0], date: q[1], flight: q[2], dep: q[3], arr: q[4], masterLogId: id164, captain: 'AN GEEWON' };
+  assert.throws(() => e.run('saveFlightCaptain(' + JSON.stringify(request) + ')'), /변경/);
+  assert.deepEqual(e.writes, []);
+  assert.throws(() => e.run('saveFlightCaptain(' + JSON.stringify({ ...request, captain: '=1+1' }) + ')'), /이름/);
+  e.run('saveFlightCaptain(' + JSON.stringify({ ...request, previousCaptain: 'JANG JIHUN' }) + ')');
+  original[13] = 'AN GEEWON';
+  assert.deepEqual(correct, original);
+  assert.deepEqual(wrong, other);
+  assert.deepEqual(notes[2], note);
+  assert.deepEqual(e.writes.map(w => w.slice(0, 3)), [['SCHEDULE_QUEUE', 2, 12], ['FLIGHT_LOG_MASTER', 2, 14]]);
+});
 
 test('KE164 Today prefers Queue ID over a conflicting calendar-date row and event ID', () => {
   const correct = master('2026-10-06', 'KE164', 'DYG', 'ICN', id164);
