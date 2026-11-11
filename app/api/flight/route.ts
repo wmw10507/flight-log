@@ -8,7 +8,7 @@ const API_KEY =
 
 // Official imports must use their dedicated, gated endpoint.
 const ALLOWED_ACTIONS = new Set([
-  "getAppData", "savePostFlight", "saveFlightCaptain", "getHistoryMonth", "getRecencyData",
+  "getAppData", "savePostFlight", "saveFlightCaptain", "getHistoryMonth", "getFlightTimeSummary", "getRecencyData",
   "getCaptainCard", "getCaptains", "getCaptainProfile", "saveCaptainProfile",
 ]);
 
