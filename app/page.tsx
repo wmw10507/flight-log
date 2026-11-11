@@ -225,14 +225,15 @@ async function apiCall(action: string, payload?: unknown, fresh = false): Promis
 }
 
 type TimePeriod = {
-  officialBlock: number; officialMolit: number; officialSectors: number;
-  pendingBlock: number; pendingMolit: number; pendingSectors: number;
+  officialMolit: number; officialSectors: number;
+  pendingMolit: number; pendingSectors: number;
 };
 
 type FlightTimeSummary = {
   asOf: string;
   periods: Record<"total" | "year" | "month", TimePeriod>;
   historicalMinutes: number | null;
+  aircraft?: { aircraft: string; total: number; year: number; month: number }[];
 };
 
 function flightHours(minutes: number) {
@@ -240,7 +241,6 @@ function flightHours(minutes: number) {
 }
 
 function FlightTimeOverview() {
-  const [basis, setBasis] = useState<"Block" | "MOLIT">("Block");
   const [data, setData] = useState<FlightTimeSummary | null>(null);
   const [error, setError] = useState("");
   const [refresh, setRefresh] = useState(0);
@@ -269,14 +269,7 @@ function FlightTimeOverview() {
     <section aria-label="내 비행시간" className="mb-8 rounded-2xl border border-[var(--line)] p-4 sm:p-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <h2 className="text-lg font-bold">내 비행시간</h2>
-        <div className="flex gap-1 rounded-lg bg-[var(--soft)] p-1" role="group" aria-label="시간 기준">
-          {(["Block", "MOLIT"] as const).map(option => (
-            <button key={option} type="button" aria-pressed={basis === option} onClick={() => setBasis(option)}
-              className={`rounded-md px-3 py-1.5 text-sm font-semibold ${basis === option ? "bg-[var(--blue-soft)] text-[var(--blue)]" : "text-[var(--muted)]"}`}>
-              {option}
-            </button>
-          ))}
-        </div>
+        <span className="rounded-lg bg-[var(--soft)] px-3 py-1.5 text-xs font-semibold text-[var(--muted)]">MOLIT 인정시간</span>
       </div>
       {error ? (
         <p role="alert" className="mt-3 text-sm text-[var(--danger)]">{error} <button type="button" onClick={reload} className="underline">다시 시도</button></p>
@@ -285,9 +278,9 @@ function FlightTimeOverview() {
           <div className="mt-4 grid grid-cols-3 gap-2 sm:gap-3">
             {cards.map(({ key, label }) => {
               const period = data.periods[key];
-              const career = key === "total" && basis === "MOLIT" && data.historicalMinutes !== null;
-              const official = basis === "Block" ? period.officialBlock : period.officialMolit;
-              const pending = basis === "Block" ? period.pendingBlock : period.pendingMolit;
+              const career = key === "total" && data.historicalMinutes !== null;
+              const official = period.officialMolit;
+              const pending = period.pendingMolit;
               return (
                 <div key={key} className="min-w-0 rounded-xl bg-[var(--soft)] p-2.5 sm:p-4">
                   <div className="text-xs font-semibold text-[var(--muted)]">{label}</div>
@@ -305,9 +298,34 @@ function FlightTimeOverview() {
             })}
           </div>
           <div className="mt-3 flex flex-wrap justify-between gap-2 text-xs text-[var(--muted)]">
-            <span>{basis === "Block" ? "대한항공 운항 기록 기준 · 관찰·이동편 제외" : "MOLIT는 인정시간입니다. 누적에는 과거 공식 항공기 경력이 포함됩니다."} · {data.asOf} 기준</span>
+            <span>누적에는 과거 공식 항공기 경력이 포함됩니다. · {data.asOf} 기준</span>
             <button type="button" className="underline" onClick={reload}>비행시간 새로고침</button>
           </div>
+          {!!data.aircraft?.length && (
+            <details className="mt-4 border-t border-[var(--line)] pt-3">
+              <summary className="cursor-pointer text-sm font-semibold">기종별 인정시간</summary>
+              <table className="mt-3 w-full table-fixed text-left text-xs tabular-nums sm:text-sm">
+                <thead className="text-[var(--muted)]">
+                  <tr>
+                    <th scope="col" className="w-2/5 py-2">기종</th>
+                    <th scope="col" className="text-right">누적</th>
+                    <th scope="col" className="text-right">올해</th>
+                    <th scope="col" className="text-right">이번 달</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[var(--line)]">
+                  {data.aircraft.map(row => (
+                    <tr key={row.aircraft}>
+                      <th scope="row" className="break-words py-2.5 pr-1 font-medium">{row.aircraft}</th>
+                      <td className="text-right">{flightHours(row.total)}</td>
+                      <td className="text-right">{row.year ? flightHours(row.year) : "—"}</td>
+                      <td className="text-right">{row.month ? flightHours(row.month) : "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </details>
+          )}
         </>
       ) : <p role="status" className="mt-3 text-sm text-[var(--muted)]">비행시간을 불러오는 중…</p>}
     </section>

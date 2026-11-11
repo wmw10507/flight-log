@@ -1993,6 +1993,16 @@ function getFlightTimeSummary() {
   const year = asOf.slice(0, 4);
   const month = asOf.slice(0, 7);
   const periods = {};
+  const byAircraft = new Map();
+  function addAircraft(type, minutes, date) {
+    if (minutes <= 0) return;
+    const aircraft = String(type || '').trim() || '기종 미분류';
+    const stats = byAircraft.get(aircraft) || { aircraft: aircraft, total: 0, year: 0, month: 0 };
+    stats.total += minutes;
+    if (date && date.slice(0, 4) === year) stats.year += minutes;
+    if (date && date.slice(0, 7) === month) stats.month += minutes;
+    byAircraft.set(aircraft, stats);
+  }
   ['total', 'year', 'month'].forEach(function(period) {
     periods[period] = {
       officialBlock: 0, officialMolit: 0, officialSectors: 0,
@@ -2002,19 +2012,21 @@ function getFlightTimeSummary() {
   const count = master.getLastRow() - 1;
   if (count > 0) {
     const rows = master.getRange(2, 1, count, MASTER_COL.MOLIT).getDisplayValues();
-    const statuses = master.getRange(2, MASTER_COL.RECORD_STATUS, count, 1).getDisplayValues();
+    const details = master.getRange(2, MASTER_COL.TYPE_RAW, count, MASTER_COL.RECORD_STATUS - MASTER_COL.TYPE_RAW + 1).getDisplayValues();
     rows.forEach(function(row, i) {
       const date = normalizeDateString(row[MASTER_COL.DATE - 1]);
       if (!row[MASTER_COL.LOG_ID - 1] || !date || date > asOf) return;
       const duty = String(row[MASTER_COL.DUTY - 1] || '').trim().toUpperCase();
       const position = String(row[MASTER_COL.POSITION - 1] || '').trim().toUpperCase();
       if (/^(O|EX|DH|TVL)$/.test(duty) || /OBSERVATION|DEADHEAD|TRAVEL/.test(position)) return;
-      const status = String(statuses[i][0] || '').trim().toUpperCase();
+      const detail = details[i];
+      const status = String(detail[MASTER_COL.RECORD_STATUS - MASTER_COL.TYPE_RAW] || '').trim().toUpperCase();
       const bucket = /^(OFFICIAL|OFFICIAL CONFIRMED)$/.test(status) ? 'official'
         : /^FLOWN\s*\/\s*PROVISIONAL$/.test(status) ? 'pending' : '';
       if (!bucket) return;
       const block = durationMinutes_(row[MASTER_COL.BLOCK - 1]) || 0;
       const molit = durationMinutes_(row[MASTER_COL.MOLIT - 1]) || 0;
+      if (bucket === 'official') addAircraft(detail[MASTER_COL.STANDARD_TYPE - MASTER_COL.TYPE_RAW] || detail[0], molit, date);
       const keys = ['total'];
       if (date.slice(0, 4) === year) keys.push('year');
       if (date.slice(0, 7) === month) keys.push('month');
@@ -2036,11 +2048,18 @@ function getFlightTimeSummary() {
         return /^(Civil training certificate|Military flight experience certificate)$/.test(row[1])
           && row[6] === 'AIRCRAFT' && /^(VERIFIED|CHECK)$/.test(row[28]);
       })
-      .map(function(row) { return durationMinutes_(row[15]); })
+      .map(function(row) {
+        const subtotal = durationMinutes_(row[15]);
+        addAircraft(row[5], subtotal || 0, '');
+        return subtotal;
+      })
       .filter(function(value) { return value !== null; });
     if (minutes.length) historicalMinutes = minutes.reduce(function(total, value) { return total + value; }, 0);
   }
-  return { asOf: asOf, periods: periods, historicalMinutes: historicalMinutes };
+  const aircraft = Array.from(byAircraft.values()).sort(function(a, b) {
+    return b.total - a.total || a.aircraft.localeCompare(b.aircraft);
+  });
+  return { asOf: asOf, periods: periods, historicalMinutes: historicalMinutes, aircraft: aircraft };
 }
 
 function getHistoryMonth(
@@ -5661,7 +5680,7 @@ function getCaptains() {
 
 
 /* v0.2.6: caches never supply write/identity decisions. */
-const BACKEND_VERSION = '0.3.5-flight-time-summary';
+const BACKEND_VERSION = '0.3.6-aircraft-time';
 const flightExecution_ = { spreadsheets: {}, masterIndex: null };
 
 function openFlightSpreadsheet_(id) {
