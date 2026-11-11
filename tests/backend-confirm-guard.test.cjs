@@ -31,7 +31,7 @@ test("Backend denies both Confirm entry points and authenticated doPost before s
     const result = b.ctx.doPost({ postData: { contents: JSON.stringify({ apiKey: "test-key", action: "confirmOfficialImport", payload: {} }) } });
     assert.equal(result.ok, false);
     assert.match(result.error, /Confirm is disabled/);
-    assert.equal(result.backendVersion, "0.3.4-manual-captain");
+    assert.equal(result.backendVersion, "0.3.5-flight-time-summary");
     assert.deepEqual(b.effects, []);
   }
 });

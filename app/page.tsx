@@ -168,7 +168,7 @@ function captainKey(name: string) {
 ========================================================= */
 
 const APP_VERSION = "0.3.0";
-const readActions = new Set(["getAppData", "getHistoryMonth", "getRecencyData", "getCaptains", "getCaptainProfile", "getCaptainCard"]);
+const readActions = new Set(["getAppData", "getHistoryMonth", "getFlightTimeSummary", "getRecencyData", "getCaptains", "getCaptainProfile", "getCaptainCard"]);
 const clientReads = new Map<string, { value: unknown; expires: number }>();
 // API payloads vary by action; callers narrow the returned shape.
  // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -222,6 +222,96 @@ async function apiCall(action: string, payload?: unknown, fresh = false): Promis
   if (isRead) pendingReads.set(key, request);
   try { return await request; }
   finally { if (pendingReads.get(key) === request) pendingReads.delete(key); }
+}
+
+type TimePeriod = {
+  officialBlock: number; officialMolit: number; officialSectors: number;
+  pendingBlock: number; pendingMolit: number; pendingSectors: number;
+};
+
+type FlightTimeSummary = {
+  asOf: string;
+  periods: Record<"total" | "year" | "month", TimePeriod>;
+  historicalMinutes: number | null;
+};
+
+function flightHours(minutes: number) {
+  return Math.floor(minutes / 60) + ":" + String(minutes % 60).padStart(2, "0");
+}
+
+function FlightTimeOverview() {
+  const [basis, setBasis] = useState<"Block" | "MOLIT">("Block");
+  const [data, setData] = useState<FlightTimeSummary | null>(null);
+  const [error, setError] = useState("");
+  const [refresh, setRefresh] = useState(0);
+  useEffect(() => {
+    let active = true;
+    void apiCall("getFlightTimeSummary", undefined, refresh > 0).then(
+      (summary: FlightTimeSummary) => { if (active) setData(summary); },
+      (err: unknown) => { if (active) setError(err instanceof Error ? err.message : "비행시간을 불러오지 못했습니다."); }
+    );
+    return () => { active = false; };
+  }, [refresh]);
+
+  function reload() {
+    setError("");
+    setData(null);
+    setRefresh(value => value + 1);
+  }
+
+  const cards = [
+    { key: "total", label: "누적" },
+    { key: "year", label: "올해" },
+    { key: "month", label: "이번 달" },
+  ] as const;
+
+  return (
+    <section aria-label="내 비행시간" className="mb-8 rounded-2xl border border-[var(--line)] p-4 sm:p-5">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <h2 className="text-lg font-bold">내 비행시간</h2>
+        <div className="flex gap-1 rounded-lg bg-[var(--soft)] p-1" role="group" aria-label="시간 기준">
+          {(["Block", "MOLIT"] as const).map(option => (
+            <button key={option} type="button" aria-pressed={basis === option} onClick={() => setBasis(option)}
+              className={`rounded-md px-3 py-1.5 text-sm font-semibold ${basis === option ? "bg-[var(--blue-soft)] text-[var(--blue)]" : "text-[var(--muted)]"}`}>
+              {option}
+            </button>
+          ))}
+        </div>
+      </div>
+      {error ? (
+        <p role="alert" className="mt-3 text-sm text-[var(--danger)]">{error} <button type="button" onClick={reload} className="underline">다시 시도</button></p>
+      ) : data ? (
+        <>
+          <div className="mt-4 grid grid-cols-3 gap-2 sm:gap-3">
+            {cards.map(({ key, label }) => {
+              const period = data.periods[key];
+              const career = key === "total" && basis === "MOLIT" && data.historicalMinutes !== null;
+              const official = basis === "Block" ? period.officialBlock : period.officialMolit;
+              const pending = basis === "Block" ? period.pendingBlock : period.pendingMolit;
+              return (
+                <div key={key} className="min-w-0 rounded-xl bg-[var(--soft)] p-2.5 sm:p-4">
+                  <div className="text-xs font-semibold text-[var(--muted)]">{label}</div>
+                  <div className="mt-1 text-lg font-bold tabular-nums sm:text-2xl">{flightHours(official + (career ? data.historicalMinutes ?? 0 : 0))}</div>
+                  <div className="mt-1 text-xs text-[var(--muted)]">
+                    {career ? "전체 경력 인정시간" : key === "month" ? `${period.officialSectors}개 확정 구간` : "대한항공 확정"}
+                  </div>
+                  {period.pendingSectors > 0 && (
+                    <div className="mt-2 text-xs text-[var(--blue)]">
+                      {pending > 0 ? `미확정 +${flightHours(pending)}` : `미확정 ${period.pendingSectors}개 구간`}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+          <div className="mt-3 flex flex-wrap justify-between gap-2 text-xs text-[var(--muted)]">
+            <span>{basis === "Block" ? "대한항공 운항 기록 기준 · 관찰·이동편 제외" : "MOLIT는 인정시간입니다. 누적에는 과거 공식 항공기 경력이 포함됩니다."} · {data.asOf} 기준</span>
+            <button type="button" className="underline" onClick={reload}>비행시간 새로고침</button>
+          </div>
+        </>
+      ) : <p role="status" className="mt-3 text-sm text-[var(--muted)]">비행시간을 불러오는 중…</p>}
+    </section>
+  );
 }
 
 function FlightCaptainEditor({ flight, onSaved }: {
@@ -2144,6 +2234,8 @@ export default function Home() {
           tab === "history" && (
 
             <div className="pt-8">
+
+              <FlightTimeOverview />
 
               <div className="grid gap-10 lg:grid-cols-[1fr_.85fr]">
 

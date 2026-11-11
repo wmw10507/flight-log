@@ -1985,6 +1985,64 @@ function updateQueueAfterSave(
    HISTORY
 ========================================================= */
 
+function getFlightTimeSummary() {
+  const ss = openFlightSpreadsheet_(CONFIG.SPREADSHEET_ID);
+  const master = ss.getSheetByName(CONFIG.MASTER_SHEET);
+  const historical = ss.getSheetByName('HISTORICAL_SUMMARY');
+  const asOf = Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'yyyy-MM-dd');
+  const year = asOf.slice(0, 4);
+  const month = asOf.slice(0, 7);
+  const periods = {};
+  ['total', 'year', 'month'].forEach(function(period) {
+    periods[period] = {
+      officialBlock: 0, officialMolit: 0, officialSectors: 0,
+      pendingBlock: 0, pendingMolit: 0, pendingSectors: 0
+    };
+  });
+  const count = master.getLastRow() - 1;
+  if (count > 0) {
+    const rows = master.getRange(2, 1, count, MASTER_COL.MOLIT).getDisplayValues();
+    const statuses = master.getRange(2, MASTER_COL.RECORD_STATUS, count, 1).getDisplayValues();
+    rows.forEach(function(row, i) {
+      const date = normalizeDateString(row[MASTER_COL.DATE - 1]);
+      if (!row[MASTER_COL.LOG_ID - 1] || !date || date > asOf) return;
+      const duty = String(row[MASTER_COL.DUTY - 1] || '').trim().toUpperCase();
+      const position = String(row[MASTER_COL.POSITION - 1] || '').trim().toUpperCase();
+      if (/^(O|EX|DH|TVL)$/.test(duty) || /OBSERVATION|DEADHEAD|TRAVEL/.test(position)) return;
+      const status = String(statuses[i][0] || '').trim().toUpperCase();
+      const bucket = /^(OFFICIAL|OFFICIAL CONFIRMED)$/.test(status) ? 'official'
+        : /^FLOWN\s*\/\s*PROVISIONAL$/.test(status) ? 'pending' : '';
+      if (!bucket) return;
+      const block = durationMinutes_(row[MASTER_COL.BLOCK - 1]) || 0;
+      const molit = durationMinutes_(row[MASTER_COL.MOLIT - 1]) || 0;
+      const keys = ['total'];
+      if (date.slice(0, 4) === year) keys.push('year');
+      if (date.slice(0, 7) === month) keys.push('month');
+      keys.forEach(function(key) {
+        periods[key][bucket + 'Block'] += block;
+        periods[key][bucket + 'Molit'] += molit;
+        periods[key][bucket + 'Sectors']++;
+      });
+    });
+  }
+
+  // Career baseline is the aircraft subtotal from the pre-airline certificates.
+  // Preserve the source subtotal even when its split columns are flagged CHECK.
+  let historicalMinutes = null;
+  if (historical && historical.getLastRow() > 1) {
+    const aircraft = historical.getRange(2, 1, historical.getLastRow() - 1, 29).getDisplayValues();
+    const minutes = aircraft
+      .filter(function(row) {
+        return /^(Civil training certificate|Military flight experience certificate)$/.test(row[1])
+          && row[6] === 'AIRCRAFT' && /^(VERIFIED|CHECK)$/.test(row[28]);
+      })
+      .map(function(row) { return durationMinutes_(row[15]); })
+      .filter(function(value) { return value !== null; });
+    if (minutes.length) historicalMinutes = minutes.reduce(function(total, value) { return total + value; }, 0);
+  }
+  return { asOf: asOf, periods: periods, historicalMinutes: historicalMinutes };
+}
+
 function getHistoryMonth(
   year,
   month
@@ -4813,6 +4871,10 @@ function doPost(e) {
     // HISTORY
     // =====================================================
 
+    if (action === 'getFlightTimeSummary') {
+      return jsonResponse_({ ok: true, data: cachedFlightRead_('getFlightTimeSummary', payload, getFlightTimeSummary) });
+    }
+
     if (action === 'getHistoryMonth') {
       const year = Number(payload.year);
       const month = Number(payload.month);
@@ -5599,7 +5661,7 @@ function getCaptains() {
 
 
 /* v0.2.6: caches never supply write/identity decisions. */
-const BACKEND_VERSION = '0.3.4-manual-captain';
+const BACKEND_VERSION = '0.3.5-flight-time-summary';
 const flightExecution_ = { spreadsheets: {}, masterIndex: null };
 
 function openFlightSpreadsheet_(id) {
